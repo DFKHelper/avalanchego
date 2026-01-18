@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	stdatomic "sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -244,6 +245,12 @@ type ManagerConfig struct {
 	ChainDataDir string
 
 	Subnets *Subnets
+
+	// CreateChainDB creates a per-chain isolated database.
+	// If nil, falls back to shared database (DB field) with chain ID prefixing.
+	// This function enables physical per-chain database separation, allowing
+	// independent management and deletion of each chain's data.
+	CreateChainDB func(chainID ids.ID) (database.Database, error)
 }
 
 type manager struct {
@@ -268,6 +275,11 @@ type manager struct {
 	// Key: Chain's ID
 	// Value: The chain
 	chains map[ids.ID]handler.Handler
+
+	// Per-chain databases that need to be closed on shutdown.
+	// Only populated when using per-chain database isolation (CreateChainDB != nil).
+	// Key: Chain's ID, Value: The chain's database
+	chainDatabases map[ids.ID]database.Database
 
 	// snowman++ related interface to allow validators retrieval
 	validatorState validators.State
@@ -329,6 +341,7 @@ func New(config *ManagerConfig) (Manager, error) {
 		Aliaser:                ids.NewAliaser(),
 		ManagerConfig:          *config,
 		chains:                 make(map[ids.ID]handler.Handler),
+		chainDatabases:         make(map[ids.ID]database.Database),
 		chainsQueue:            buffer.NewUnboundedBlockingDeque[ChainParameters](initialQueueSize),
 		unblockChainCreatorCh:  make(chan struct{}),
 		chainCreatorShutdownCh: make(chan struct{}),
@@ -453,7 +466,8 @@ func (m *manager) createChain(chainParams ChainParameters) {
 	// Allows messages to be routed to the new chain. If the handler hasn't been
 	// started and a message is forwarded, then the message will block until the
 	// handler is started.
-	m.ManagerConfig.Router.AddChain(context.TODO(), chain.Handler)
+	// Use background context for chain handler registration - runs for chain lifetime
+	m.ManagerConfig.Router.AddChain(context.Background(), chain.Handler)
 
 	// Register bootstrapped health checks after P chain has been added to
 	// chains.
@@ -463,13 +477,15 @@ func (m *manager) createChain(chainParams ChainParameters) {
 	//       the manager.
 	if chainParams.ID == constants.PlatformChainID {
 		if err := m.registerBootstrappedHealthChecks(); err != nil {
-			chain.Handler.StopWithError(context.TODO(), err)
+			// Use background context for error handling during startup
+			chain.Handler.StopWithError(context.Background(), err)
 		}
 	}
 
 	// Tell the chain to start processing messages.
 	// If the X, P, or C Chain panics, do not attempt to recover
-	chain.Handler.Start(context.TODO(), !m.CriticalChains.Contains(chainParams.ID))
+	// Use background context for chain handler start - runs for chain lifetime
+	chain.Handler.Start(context.Background(), !m.CriticalChains.Contains(chainParams.ID))
 }
 
 // Create a chain
@@ -532,7 +548,24 @@ func (m *manager) buildChain(chainParams ChainParameters, sb subnets.Subnet) (*c
 	if err != nil {
 		return nil, fmt.Errorf("error while creating vm: %w", err)
 	}
-	// TODO: Shutdown VM if an error occurs
+
+	// Ensure VM is shut down if chain creation fails
+	// succeeded tracks whether we successfully completed chain creation
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			// Type assert to common.VM to call Shutdown
+			if commonVM, ok := vm.(common.VM); ok {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if shutdownErr := commonVM.Shutdown(shutdownCtx); shutdownErr != nil {
+					chainLog.Error("failed to shutdown VM after error",
+						zap.Error(shutdownErr),
+					)
+				}
+			}
+		}
+	}()
 
 	chainFxs := make([]*common.Fx, len(chainParams.FxIDs))
 	for i, fxID := range chainParams.FxIDs {
@@ -593,10 +626,17 @@ func (m *manager) buildChain(chainParams ChainParameters, sb subnets.Subnet) (*c
 		return nil, err
 	}
 
-	return chain, errors.Join(
+	registrationErr := errors.Join(
 		m.snowmanGatherer.Register(primaryAlias, ctx.Registerer),
 		vmGatherer.Register(primaryAlias, ctx.Metrics),
 	)
+	if registrationErr != nil {
+		return nil, registrationErr
+	}
+
+	// Mark as succeeded to prevent VM shutdown in defer
+	succeeded = true
+	return chain, nil
 }
 
 func (m *manager) AddRegistrant(r Registrant) {
@@ -621,25 +661,56 @@ func (m *manager) createAvalancheChain(
 	})
 
 	primaryAlias := m.PrimaryAliasOrDefault(ctx.ChainID)
-	meterDBReg, err := metrics.MakeAndRegister(
-		m.MeterDBMetrics,
-		primaryAlias,
-	)
-	if err != nil {
-		return nil, err
+
+	// Create database for this chain.
+	// Use per-chain isolated database if available (CreateChainDB != nil),
+	// otherwise fall back to shared database with chain ID prefixing for backward compatibility.
+	var baseDB database.Database
+	if m.CreateChainDB != nil {
+		// Per-chain database isolation: each chain gets its own physical database directory.
+		// This enables independent management and deletion of each chain's data.
+		chainDB, err := m.CreateChainDB(ctx.ChainID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create per-chain database for chain %s: %w", ctx.ChainID, err)
+		}
+		baseDB = chainDB
+
+		// Track the database for proper cleanup on shutdown
+		m.chainsLock.Lock()
+		m.chainDatabases[ctx.ChainID] = chainDB
+		m.chainsLock.Unlock()
+
+		ctx.Log.Info("using per-chain isolated database",
+			zap.String("chainID", ctx.ChainID.String()),
+		)
+	} else {
+		// Legacy mode: shared database with chain ID prefixing (logical isolation only).
+		// All chains' data is stored in a monolithic database, separated by key prefixes.
+		meterDBReg, err := metrics.MakeAndRegister(
+			m.MeterDBMetrics,
+			primaryAlias,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		meterDB, err := meterdb.New(meterDBReg, m.DB)
+		if err != nil {
+			return nil, err
+		}
+
+		baseDB = prefixdb.New(ctx.ChainID[:], meterDB)
+		ctx.Log.Info("using shared database with chain ID prefixing",
+			zap.String("chainID", ctx.ChainID.String()),
+		)
 	}
 
-	meterDB, err := meterdb.New(meterDBReg, m.DB)
-	if err != nil {
-		return nil, err
-	}
-
-	prefixDB := prefixdb.New(ctx.ChainID[:], meterDB)
-	vmDB := prefixdb.New(VMDBPrefix, prefixDB)
-	vertexDB := prefixdb.New(VertexDBPrefix, prefixDB)
-	vertexBootstrappingDB := prefixdb.New(VertexBootstrappingDBPrefix, prefixDB)
-	txBootstrappingDB := prefixdb.New(TxBootstrappingDBPrefix, prefixDB)
-	blockBootstrappingDB := prefixdb.New(BlockBootstrappingDBPrefix, prefixDB)
+	// Create component-specific databases within the chain's database
+	vmDB := prefixdb.New(VMDBPrefix, baseDB)
+	vertexDB := prefixdb.New(VertexDBPrefix, baseDB)
+	vertexBootstrappingDB := prefixdb.New(VertexBootstrappingDBPrefix, baseDB)
+	txBootstrappingDB := prefixdb.New(TxBootstrappingDBPrefix, baseDB)
+	blockBootstrappingDB := prefixdb.New(BlockBootstrappingDBPrefix, baseDB)
 
 	avalancheMetrics, err := metrics.MakeAndRegister(
 		m.avalancheGatherer,
@@ -732,8 +803,9 @@ func (m *manager) createAvalancheChain(
 	// snowmanMessageSender here is where the metrics will be placed. Because we
 	// end up using this sender after the linearization, we pass in
 	// snowmanMessageSender here.
+	// Use background context for VM initialization - one-time setup
 	err = dagVM.Initialize(
-		context.TODO(),
+		context.Background(),
 		ctx.Context,
 		vmDB,
 		genesisData,
@@ -1070,22 +1142,53 @@ func (m *manager) createSnowmanChain(
 	})
 
 	primaryAlias := m.PrimaryAliasOrDefault(ctx.ChainID)
-	meterDBReg, err := metrics.MakeAndRegister(
-		m.MeterDBMetrics,
-		primaryAlias,
-	)
-	if err != nil {
-		return nil, err
+
+	// Create database for this chain.
+	// Use per-chain isolated database if available (CreateChainDB != nil),
+	// otherwise fall back to shared database with chain ID prefixing for backward compatibility.
+	var baseDB database.Database
+	if m.CreateChainDB != nil {
+		// Per-chain database isolation: each chain gets its own physical database directory.
+		// This enables independent management and deletion of each chain's data.
+		chainDB, err := m.CreateChainDB(ctx.ChainID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create per-chain database for chain %s: %w", ctx.ChainID, err)
+		}
+		baseDB = chainDB
+
+		// Track the database for proper cleanup on shutdown
+		m.chainsLock.Lock()
+		m.chainDatabases[ctx.ChainID] = chainDB
+		m.chainsLock.Unlock()
+
+		ctx.Log.Info("using per-chain isolated database",
+			zap.String("chainID", ctx.ChainID.String()),
+		)
+	} else {
+		// Legacy mode: shared database with chain ID prefixing (logical isolation only).
+		// All chains' data is stored in a monolithic database, separated by key prefixes.
+		meterDBReg, err := metrics.MakeAndRegister(
+			m.MeterDBMetrics,
+			primaryAlias,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		meterDB, err := meterdb.New(meterDBReg, m.DB)
+		if err != nil {
+			return nil, err
+		}
+
+		baseDB = prefixdb.New(ctx.ChainID[:], meterDB)
+		ctx.Log.Info("using shared database with chain ID prefixing",
+			zap.String("chainID", ctx.ChainID.String()),
+		)
 	}
 
-	meterDB, err := meterdb.New(meterDBReg, m.DB)
-	if err != nil {
-		return nil, err
-	}
-
-	prefixDB := prefixdb.New(ctx.ChainID[:], meterDB)
-	vmDB := prefixdb.New(VMDBPrefix, prefixDB)
-	bootstrappingDB := prefixdb.New(ChainBootstrappingDBPrefix, prefixDB)
+	// Create component-specific databases within the chain's database
+	vmDB := prefixdb.New(VMDBPrefix, baseDB)
+	bootstrappingDB := prefixdb.New(ChainBootstrappingDBPrefix, baseDB)
 
 	// Passes messages from the consensus engine to the network
 	messageSender, err := sender.New(
@@ -1222,8 +1325,9 @@ func (m *manager) createSnowmanChain(
 	}
 	vm = cn
 
+	// Use background context for VM initialization - one-time setup
 	if err := vm.Initialize(
-		context.TODO(),
+		context.Background(),
 		ctx.Context,
 		vmDB,
 		genesisData,
@@ -1369,6 +1473,83 @@ func (m *manager) createSnowmanChain(
 		VM:                             vm,
 		Bootstrapped:                   bootstrapFunc,
 	}
+
+	// State sync retry state tracking for reviver mechanism
+	chainID := ctx.ChainID // Capture for closure
+	var (
+		stateSyncerRef      common.StateSyncer
+		retryRequestID      uint32 = 100000
+		stateSyncRetryCount stdatomic.Int32
+	)
+
+	// RequestStateSyncRetry callback - enables automatic state sync retry after fallback
+	// This is called by the bootstrapper when conditions warrant a retry (stuck detection + time passed)
+	bootstrapCfg.RequestStateSyncRetry = func(ctx context.Context) error {
+		retryCount := stateSyncRetryCount.Add(1)
+
+		const maxStateSyncRetries = 3
+		if retryCount > maxStateSyncRetries {
+			m.Log.Error("REVIVER: Max retry limit exceeded, clearing summary",
+				zap.Stringer("chainID", chainID),
+				zap.Int32("attempts", retryCount),
+				zap.Int("maxRetries", maxStateSyncRetries))
+
+			// Clear summary so we stop retrying (fall back to block sync permanently)
+			if ssVM, ok := vm.(interface{ ClearOngoingSummary() error }); ok {
+				if err := ssVM.ClearOngoingSummary(); err != nil {
+					m.Log.Warn("Failed to clear summary after max retries", zap.Error(err))
+				}
+			}
+			return fmt.Errorf("state sync retry limit exceeded (%d attempts)", retryCount)
+		}
+
+		m.Log.Warn("===========================================")
+		m.Log.Warn("REVIVER: Attempting state sync retry")
+		m.Log.Warn("===========================================",
+			zap.Stringer("chainID", chainID),
+			zap.Int32("attempt", retryCount),
+			zap.Int("maxRetries", maxStateSyncRetries))
+
+		// Verify state syncer is initialized
+		if stateSyncerRef == nil {
+			m.Log.Error("REVIVER: State syncer not initialized", zap.Stringer("chainID", chainID))
+			return fmt.Errorf("state syncer not initialized")
+		}
+
+		// Cast to restartable interface
+		type restartable interface {
+			Restart(ctx context.Context, startReqID uint32) error
+		}
+
+		rs, ok := stateSyncerRef.(restartable)
+		if !ok {
+			m.Log.Error("REVIVER: State syncer does not implement Restart()",
+				zap.Stringer("chainID", chainID),
+				zap.String("type", fmt.Sprintf("%T", stateSyncerRef)))
+			return fmt.Errorf("state syncer does not support restart")
+		}
+
+		// Attempt restart with incremented request ID
+		retryRequestID++
+		err := rs.Restart(ctx, retryRequestID)
+
+		if err != nil {
+			m.Log.Error("REVIVER: Restart failed",
+				zap.Stringer("chainID", chainID),
+				zap.Int32("attempt", retryCount),
+				zap.Error(err))
+			return fmt.Errorf("restart failed: %w", err)
+		}
+
+		m.Log.Warn("===========================================")
+		m.Log.Warn("REVIVER: State sync restarted successfully")
+		m.Log.Warn("===========================================")
+
+		// Reset retry counter on success
+		stateSyncRetryCount.Store(0)
+		return nil
+	}
+
 	var bootstrapper common.BootstrapableEngine
 	bootstrapper, err = smbootstrap.New(
 		bootstrapCfg,
@@ -1401,6 +1582,10 @@ func (m *manager) createSnowmanChain(
 		stateSyncCfg,
 		bootstrapper.Start,
 	)
+
+	// Populate the state syncer reference BEFORE tracing wraps it
+	// This ensures the callback can access the Restart method even when tracing is enabled
+	stateSyncerRef = stateSyncer
 
 	if m.TracingEnabled {
 		stateSyncer = common.TraceStateSyncer(stateSyncer, m.Tracer)
@@ -1528,7 +1713,28 @@ func (m *manager) Shutdown() {
 	m.chainsQueue.Close()
 	close(m.chainCreatorShutdownCh)
 	m.chainCreatorExited.Wait()
-	m.ManagerConfig.Router.Shutdown(context.TODO())
+
+	// Use timeout context for router shutdown to prevent indefinite blocking
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	m.ManagerConfig.Router.Shutdown(shutdownCtx)
+
+	// Close per-chain databases if using per-chain isolation
+	m.chainsLock.Lock()
+	defer m.chainsLock.Unlock()
+
+	for chainID, db := range m.chainDatabases {
+		if err := db.Close(); err != nil {
+			m.Log.Error("failed to close per-chain database",
+				zap.Stringer("chainID", chainID),
+				zap.Error(err),
+			)
+		} else {
+			m.Log.Info("closed per-chain database",
+				zap.Stringer("chainID", chainID),
+			)
+		}
+	}
 }
 
 // LookupVM returns the ID of the VM associated with an alias

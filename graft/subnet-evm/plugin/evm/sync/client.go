@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/rawdb"
@@ -20,6 +21,7 @@ import (
 	"github.com/ava-labs/avalanchego/database/versiondb"
 	"github.com/ava-labs/avalanchego/graft/evm/core/state/snapshot"
 	"github.com/ava-labs/avalanchego/graft/subnet-evm/eth"
+	"github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm/customrawdb"
 	"github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm/message"
 	"github.com/ava-labs/avalanchego/graft/subnet-evm/sync/statesync"
 	"github.com/ava-labs/avalanchego/ids"
@@ -36,8 +38,9 @@ const ParentsToFetch = 256
 var (
 	_ Acceptor = (*client)(nil)
 
-	errSkipSync        = errors.New("skip sync")
-	errCommitCancelled = errors.New("commit cancelled")
+	errSkipSync          = errors.New("skip sync")
+	errCommitCancelled   = errors.New("commit cancelled")
+	errStateSyncFallback = errors.New("state sync fallback to block sync (not an error)")
 
 	stateSyncSummaryKey = []byte("stateSyncSummary")
 )
@@ -114,6 +117,10 @@ type client struct {
 
 	// State Sync results
 	err error
+
+	// Mutex to protect cleanup operations from concurrent execution
+	// Prevents race conditions when multiple goroutines try to clean up simultaneously
+	cleanupMutex sync.Mutex
 }
 
 func NewClient(config *ClientConfig) Client {
@@ -130,8 +137,221 @@ type Client interface {
 
 	// additional methods required by the evm package
 	ClearOngoingSummary() error
+	DetectAndCleanCorruptedState(ctx context.Context) error
 	Shutdown() error
 	Error() error
+}
+
+// ErrStateSyncFallback returns the sentinel error for state sync fallback.
+// This allows external packages to check for this specific condition.
+func ErrStateSyncFallback() error {
+	return errStateSyncFallback
+}
+
+// clearSyncProgress clears the in-progress sync data (segments, storage tries, snapshots)
+// while PRESERVING the resumable summary metadata. This allows the reviver mechanism to
+// detect and retry stuck state syncs.
+// Use this for Tier 2 cleanup: when sync is stuck but state is not corrupted.
+func (client *client) clearSyncProgress(ctx context.Context) error {
+	// CRITICAL: Acquire cleanup mutex to prevent concurrent cleanup operations
+	// Multiple goroutines could theoretically call fallback simultaneously
+	client.cleanupMutex.Lock()
+	defer client.cleanupMutex.Unlock()
+
+	return client.doClearSyncProgress(ctx)
+}
+
+// doClearSyncProgress is the internal implementation without mutex acquisition.
+// Should only be called while holding cleanupMutex.
+func (client *client) doClearSyncProgress(ctx context.Context) error {
+	log.Info("Clearing state sync progress (preserving summary for reviver)...")
+
+	// CRITICAL: Mark cleanup as in-progress for crash recovery
+	// If we crash mid-cleanup, on restart we'll detect this marker and complete cleanup
+	if err := customrawdb.MarkCleanupInProgress(client.ChaindDB); err != nil {
+		return fmt.Errorf("failed to mark cleanup in progress: %w", err)
+	}
+
+	// Step 1: Clear all state sync progress markers
+	log.Info("Clearing state sync segments...")
+	if err := customrawdb.ClearAllSyncSegments(client.ChaindDB); err != nil {
+		log.Warn("Failed to clear sync segments (non-fatal)", "err", err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		log.Warn("Cleanup interrupted by context cancellation", "err", err)
+		return err
+	}
+
+	log.Info("Clearing state sync storage tries...")
+	if err := customrawdb.ClearAllSyncStorageTries(client.ChaindDB); err != nil {
+		log.Warn("Failed to clear sync storage tries (non-fatal)", "err", err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		log.Warn("Cleanup interrupted by context cancellation", "err", err)
+		return err
+	}
+
+	// Step 2: Wipe corrupted snapshot data
+	log.Info("Wiping snapshot data...")
+	wipeDone := snapshot.WipeSnapshot(client.ChaindDB, true)
+
+	// CRITICAL: WipeSnapshot only closes the channel on SUCCESS
+	// If wipe fails (e.g., disk full, I/O error), the channel is never closed
+	// We must detect this with a timeout to avoid hanging forever
+	wipeTimeout := time.After(5 * time.Minute) // Generous timeout for large databases
+
+	select {
+	case <-wipeDone:
+		log.Info("Snapshot wipe completed successfully")
+	case <-wipeTimeout:
+		log.Error("Snapshot wipe timed out after 5 minutes - likely failed")
+		return fmt.Errorf("snapshot wipe timed out, state may be corrupted")
+	case <-ctx.Done():
+		log.Warn("Snapshot wipe interrupted by context cancellation")
+		return ctx.Err()
+	}
+
+	// Step 3: Reset snapshot generation state
+	log.Info("Resetting snapshot generation state...")
+	snapshot.ResetSnapshotGeneration(client.ChaindDB)
+
+	// Step 4: Delete snapshot block hash marker
+	customrawdb.DeleteSnapshotBlockHash(client.ChaindDB)
+
+	// CRITICAL: Do NOT clear the ongoing summary - preserve for reviver
+
+	// CRITICAL: Clear the cleanup-in-progress marker to indicate successful completion
+	// If this fails, cleanup will run again on every restart, wasting resources
+	if err := customrawdb.ClearCleanupInProgress(client.ChaindDB); err != nil {
+		log.Error("Failed to clear cleanup marker - cleanup will repeat on restart", "err", err)
+		return fmt.Errorf("failed to clear cleanup marker: %w", err)
+	}
+
+	log.Info("Sync progress cleared successfully (summary preserved for resume)")
+	return nil
+}
+
+// clearSummaryMetadata clears the resumable state sync summary from the database.
+// After calling this, the reviver mechanism will NOT be able to detect resumable state.
+// Only use this when transitioning to permanent block sync (Tier 2 → Tier 3).
+func (client *client) clearSummaryMetadata() error {
+	log.Warn("Clearing state sync summary metadata (reviver will NOT work after this)")
+	if err := client.ClearOngoingSummary(); err != nil {
+		log.Warn("Failed to clear ongoing summary (non-fatal)", "err", err)
+		return err
+	}
+	log.Info("State sync summary cleared - reviver disabled")
+	return nil
+}
+
+// performFullCleanup performs complete state sync cleanup (Tier 3).
+// This removes ALL state sync data including the resumable summary.
+// Use only when state is corrupted or retry limit exceeded.
+// After this, reviver mechanism will NOT work.
+func (client *client) performFullCleanup(ctx context.Context) error {
+	// CRITICAL: Acquire cleanup mutex to make full cleanup atomic
+	// This ensures no partial cleanup state if interrupted
+	client.cleanupMutex.Lock()
+	defer client.cleanupMutex.Unlock()
+
+	log.Warn("Performing FULL state sync cleanup (reviver will NOT work after this)")
+
+	// Clear progress data (call internal method to avoid deadlock)
+	if err := client.doClearSyncProgress(ctx); err != nil {
+		return err
+	}
+
+	// Clear summary metadata
+	if err := client.clearSummaryMetadata(); err != nil {
+		return err
+	}
+
+	log.Warn("Full cleanup complete - all state sync data removed")
+	return nil
+}
+
+// performStateCleanup is the legacy cleanup function maintained for backwards compatibility.
+// It performs full cleanup (Tier 3). New code should use performFullCleanup() explicitly.
+func (client *client) performStateCleanup(ctx context.Context) error {
+	return client.performFullCleanup(ctx)
+}
+
+// validateStateSyncIntegrity checks if a state sync summary represents complete, valid state.
+// This is called before resuming a state sync to detect corrupted state from crashes.
+// Returns an error if the state is invalid or incomplete.
+// Respects context cancellation to allow graceful shutdown during validation.
+func (client *client) validateStateSyncIntegrity(ctx context.Context, summaryBytes []byte) error {
+	// Parse the summary (without accepting it - just for validation)
+	summary, err := client.Parser.Parse(summaryBytes, func(s message.Syncable) (block.StateSyncMode, error) {
+		return block.StateSyncSkipped, nil // Just parse, don't accept
+	})
+	if err != nil {
+		return fmt.Errorf("summary parse failed: %w", err)
+	}
+
+	// Check for context cancellation after parse (which can be slow)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	blockHash := summary.GetBlockHash()
+	blockHeight := summary.Height()
+	stateRoot := summary.GetBlockRoot()
+
+	// Check 1: Does the synced block exist in chainDB?
+	block := rawdb.ReadBlock(client.ChaindDB, blockHash, blockHeight)
+	if block == nil {
+		return fmt.Errorf("synced block not found in chainDB: height=%d hash=%s",
+			blockHeight, blockHash.Hex())
+	}
+
+	// Check for context cancellation between DB operations
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Check 2: Does snapshot root match state root?
+	snapshotRoot := rawdb.ReadSnapshotRoot(client.ChaindDB)
+	if snapshotRoot == (common.Hash{}) {
+		return fmt.Errorf("snapshot root is empty/missing")
+	}
+	if snapshotRoot != stateRoot {
+		return fmt.Errorf("snapshot root mismatch: expected=%s got=%s",
+			stateRoot.Hex(), snapshotRoot.Hex())
+	}
+
+	// Check for context cancellation between DB operations
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Check 3: Verify snapshot generation marker exists
+	snapGen := rawdb.ReadSnapshotGenerator(client.ChaindDB)
+	if len(snapGen) == 0 {
+		return fmt.Errorf("snapshot generator marker missing")
+	}
+
+	// Check for context cancellation between DB operations
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Check 4: Is snapshot marked as completed?
+	// If recovery number exists and is > 0, snapshot generation is still in progress
+	recovering := rawdb.ReadSnapshotRecoveryNumber(client.ChaindDB)
+	if recovering != nil && *recovering > 0 {
+		return fmt.Errorf("snapshot recovery still in progress: %d accounts remaining", *recovering)
+	}
+
+	log.Debug("State sync integrity checks passed",
+		"blockHeight", blockHeight,
+		"blockHash", blockHash.Hex(),
+		"stateRoot", stateRoot.Hex(),
+		"snapshotRoot", snapshotRoot.Hex())
+
+	return nil
 }
 
 // Syncer represents a step in state sync,
@@ -150,8 +370,9 @@ func (client *client) StateSyncEnabled(context.Context) (bool, error) {
 
 // GetOngoingSyncStateSummary returns a state summary that was previously started
 // and not finished, and sets [resumableSummary] if one was found.
-// Returns [database.ErrNotFound] if no ongoing summary is found or if [client.skipResume] is true.
-func (client *client) GetOngoingSyncStateSummary(context.Context) (block.StateSummary, error) {
+// Returns [database.ErrNotFound] if no ongoing summary is found, if [client.skipResume] is true,
+// or if the ongoing summary fails integrity validation (indicating corrupted state from a crash).
+func (client *client) GetOngoingSyncStateSummary(ctx context.Context) (block.StateSummary, error) {
 	if client.SkipResume {
 		return nil, database.ErrNotFound
 	}
@@ -161,10 +382,48 @@ func (client *client) GetOngoingSyncStateSummary(context.Context) (block.StateSu
 		return nil, err // includes the [database.ErrNotFound] case
 	}
 
+	// Validate state integrity before resuming - detects corrupted state from crashes
+	log.Info("Found ongoing state sync summary, validating integrity before resume")
+
+	if err := client.validateStateSyncIntegrity(ctx, summaryBytes); err != nil {
+		log.Warn("State sync integrity check failed, cleaning up corrupted data",
+			"error", err)
+
+		// Corrupted state requires FULL cleanup (Tier 3) - remove ALL data including summary
+		// This ensures reviver won't try to resume from corrupted state
+		if cleanupErr := client.performFullCleanup(ctx); cleanupErr != nil {
+			// If cleanup failed due to context cancellation, it's safe to return ErrNotFound
+			// since the chain is shutting down anyway
+			if errors.Is(cleanupErr, context.Canceled) || errors.Is(cleanupErr, context.DeadlineExceeded) {
+				log.Warn("Cleanup interrupted by context cancellation", "error", cleanupErr)
+				return nil, database.ErrNotFound
+			}
+
+			// Non-context errors indicate database problems that require operator intervention
+			// to avoid infinite restart loop where we detect corruption but can't clean it
+			log.Error("CRITICAL: Failed to cleanup corrupted state - manual DB cleanup required",
+				"error", cleanupErr)
+			return nil, fmt.Errorf("corrupted state cleanup failed, summary key may remain in DB: %w", cleanupErr)
+		}
+
+		log.Info("Corrupted state cleaned up completely (including summary), will start fresh sync or block sync")
+
+		// Return ErrNotFound to tell engine there's no resumable state
+		// This forces the engine to start fresh state sync or fall back to block sync
+		return nil, database.ErrNotFound
+	}
+
+	// State is valid, parse and return
 	summary, err := client.Parser.Parse(summaryBytes, client.acceptSyncSummary)
 	if err != nil {
+		log.Error("Failed to parse validated summary", "error", err)
 		return nil, fmt.Errorf("failed to parse saved state sync summary to SyncSummary: %w", err)
 	}
+
+	log.Info("State sync integrity validated, safe to resume",
+		"blockHeight", summary.Height(),
+		"blockHash", summary.GetBlockHash().Hex())
+
 	client.resumableSummary = summary
 	return summary, nil
 }
@@ -172,12 +431,77 @@ func (client *client) GetOngoingSyncStateSummary(context.Context) (block.StateSu
 // ClearOngoingSummary clears any marker of an ongoing state sync summary
 func (client *client) ClearOngoingSummary() error {
 	if err := client.MetadataDB.Delete(stateSyncSummaryKey); err != nil {
-		return fmt.Errorf("failed to clear ongoing summary: %w", err)
+		// Ignore ErrNotFound - clearing already-cleared summary is idempotent
+		if !errors.Is(err, database.ErrNotFound) {
+			return fmt.Errorf("failed to clear ongoing summary: %w", err)
+		}
 	}
 	if err := client.VerDB.Commit(); err != nil {
 		return fmt.Errorf("failed to commit db while clearing ongoing summary: %w", err)
 	}
 
+	// Clear in-memory resumable summary to prevent stale references
+	client.resumableSummary = nil
+
+	return nil
+}
+
+// DetectAndCleanCorruptedState proactively checks for corrupted state sync data
+// (typically from crashes during sync) and cleans it up if found.
+// This should be called on startup before attempting any state sync operations.
+// Returns nil if no corruption detected or if cleanup succeeded.
+func (client *client) DetectAndCleanCorruptedState(ctx context.Context) error {
+	// CRITICAL: Check for interrupted cleanup from previous crash
+	// If cleanup was interrupted mid-operation, complete it now
+	cleanupInProgress, err := customrawdb.IsCleanupInProgress(client.ChaindDB)
+	if err != nil {
+		return fmt.Errorf("failed to check cleanup marker: %w", err)
+	}
+	if cleanupInProgress {
+		log.Warn("Detected interrupted cleanup from previous crash, completing now...")
+		if err := client.clearSyncProgress(ctx); err != nil {
+			log.Error("Failed to complete interrupted cleanup", "err", err)
+			return fmt.Errorf("failed to complete interrupted cleanup: %w", err)
+		}
+		log.Info("Successfully completed interrupted cleanup")
+	}
+
+	// Check if there's an ongoing state sync summary
+	summaryBytes, err := client.MetadataDB.Get(stateSyncSummaryKey)
+	if err != nil {
+		if errors.Is(err, database.ErrNotFound) {
+			// No ongoing summary - nothing to check
+			return nil
+		}
+		return fmt.Errorf("failed to read ongoing summary during corruption check: %w", err)
+	}
+
+	// Found an ongoing summary - validate its integrity
+	log.Info("Detecting corrupted state sync data on startup")
+
+	if err := client.validateStateSyncIntegrity(ctx, summaryBytes); err != nil {
+		log.Warn("Corrupted state sync data detected, initiating cleanup",
+			"validationError", err)
+
+		// Cleanup the corrupted state
+		if cleanupErr := client.performStateCleanup(ctx); cleanupErr != nil {
+			// If cleanup failed due to context cancellation, propagate the error
+			if errors.Is(cleanupErr, context.Canceled) || errors.Is(cleanupErr, context.DeadlineExceeded) {
+				return cleanupErr
+			}
+
+			// Non-context errors indicate database problems
+			log.Error("CRITICAL: Failed to cleanup corrupted state during startup",
+				"error", cleanupErr)
+			return fmt.Errorf("corrupted state cleanup failed: %w", cleanupErr)
+		}
+
+		log.Info("Successfully cleaned up corrupted state sync data")
+		return nil
+	}
+
+	// State is valid - no cleanup needed
+	log.Debug("State sync data integrity validated successfully")
 	return nil
 }
 
@@ -350,7 +674,46 @@ func (client *client) syncStateTrie(ctx context.Context, summary message.Syncabl
 	}
 	err = evmSyncer.Wait(ctx)
 	log.Info("state sync: sync finished", "root", summary.GetBlockRoot().Hex(), "err", err)
+
+	// Check if sync was stuck and trigger fallback to block sync
+	if errors.Is(err, statesync.ErrStateSyncStuck()) {
+		log.Warn("State sync stuck detected, initiating fallback to block sync")
+		if fallbackErr := client.fallbackToBlockSync(ctx); fallbackErr != nil {
+			return fmt.Errorf("failed to fallback to block sync: %w", fallbackErr)
+		}
+		log.Info("State sync fallback successful - node will restart with block sync")
+		// Return special fallback error to prevent AcceptSync from being called
+		// while allowing bootstrapping to continue normally.
+		return errStateSyncFallback
+	}
+
 	return err
+}
+
+// fallbackToBlockSync clears stuck state sync progress while PRESERVING the resumable summary.
+// This allows the reviver mechanism to automatically retry state sync after 30 minutes.
+// Uses Tier 2 cleanup: removes segments/snapshots but keeps summary for reviver.
+// Respects context cancellation to allow graceful shutdown during cleanup.
+func (client *client) fallbackToBlockSync(ctx context.Context) error {
+	log.Warn("===========================================")
+	log.Warn("STATE SYNC STUCK - PRESERVING RESUMABLE STATE")
+	log.Warn("Clearing corrupted progress, keeping summary for reviver...")
+	log.Warn("===========================================")
+
+	// Use Tier 2 cleanup: clear progress but PRESERVE summary for reviver
+	// This is the KEY FIX for reviver - summary must remain for retry to work
+	if err := client.clearSyncProgress(ctx); err != nil {
+		return err
+	}
+
+	log.Warn("===========================================")
+	log.Warn("CLEANUP COMPLETE - REVIVER CAN RETRY")
+	log.Warn("Summary preserved for automatic retry in 30 minutes")
+	log.Warn("Chain will continue with block sync")
+	log.Warn("State sync will be automatically retried by reviver")
+	log.Warn("This is expected behavior, not an error")
+	log.Warn("===========================================")
+	return nil
 }
 
 func (client *client) Shutdown() error {

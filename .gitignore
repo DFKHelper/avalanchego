@@ -68,3 +68,12 @@ __debug_*
 
 # solc downloads from setup-solc GitHub Action
 setup-solc_downloads/
+/.claude/*
+claude.md
+/.serena/*
+
+# Documentation directory for code sync fixes
+docs/
+
+# Development scripts
+scripts/dev/

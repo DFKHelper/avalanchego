@@ -88,6 +88,9 @@ type server struct {
 
 	metrics *metrics
 
+	// RPC response cache
+	cache *rpcCache
+
 	// Maps endpoints to handlers
 	router *router
 
@@ -109,8 +112,14 @@ func New(
 	registerer prometheus.Registerer,
 	httpConfig HTTPConfig,
 	allowedHosts []string,
+	cacheConfig RPCCacheConfig,
 ) (Server, error) {
 	m, err := newMetrics(registerer)
+	if err != nil {
+		return nil, err
+	}
+
+	cache, err := newRPCCache(log, cacheConfig, registerer)
 	if err != nil {
 		return nil, err
 	}
@@ -140,6 +149,7 @@ func New(
 		tracingEnabled:  tracingEnabled,
 		tracer:          tracer,
 		metrics:         m,
+		cache:           cache,
 		router:          router,
 		srv:             httpServer,
 		listener:        listener,
@@ -151,8 +161,12 @@ func (s *server) Dispatch() error {
 }
 
 func (s *server) RegisterChain(chainName string, ctx *snow.ConsensusContext, vm common.VM) {
+	// Use a context with timeout for handler creation to prevent indefinite blocking
+	handlerCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	ctx.Lock.Lock()
-	pathRouteHandlers, err := vm.CreateHandlers(context.TODO())
+	pathRouteHandlers, err := vm.CreateHandlers(handlerCtx)
 	ctx.Lock.Unlock()
 	if err != nil {
 		s.log.Error("failed to create path route handlers",
@@ -187,8 +201,12 @@ func (s *server) RegisterChain(chainName string, ctx *snow.ConsensusContext, vm 
 		}
 	}
 
+	// Use a context with timeout for HTTP handler creation to prevent indefinite blocking
+	httpHandlerCtx, httpHandlerCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer httpHandlerCancel()
+
 	ctx.Lock.Lock()
-	headerRouteHandler, err := vm.NewHTTPHandler(context.TODO())
+	headerRouteHandler, err := vm.NewHTTPHandler(httpHandlerCtx)
 	ctx.Lock.Unlock()
 	if err != nil {
 		s.log.Error("failed to create header route handler",
@@ -227,6 +245,10 @@ func (s *server) wrapMiddleware(chainName string, handler http.Handler, ctx *sno
 	}
 	// Apply middleware to reject calls to the handler before the chain finishes bootstrapping
 	handler = rejectMiddleware(handler, ctx)
+	// Apply RPC caching middleware (before metrics so cache hits don't count as calls)
+	if s.cache != nil {
+		handler = s.cache.Middleware(handler)
+	}
 	return s.metrics.wrapHandler(chainName, handler)
 }
 

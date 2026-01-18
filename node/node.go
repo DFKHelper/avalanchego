@@ -278,7 +278,8 @@ func New(
 		return nil, fmt.Errorf("couldn't initialize indexer: %w", err)
 	}
 
-	n.health.Start(context.TODO(), n.Config.HealthCheckFreq)
+	// Use background context for health checks - they run for the lifetime of the node
+	n.health.Start(context.Background(), n.Config.HealthCheckFreq)
 	n.initProfiler()
 
 	// Start the Platform chain
@@ -857,6 +858,66 @@ func (n *Node) initDatabase() error {
 	return nil
 }
 
+// createChainDatabase creates a separate database for a specific chain.
+// This enables per-chain database isolation, allowing each chain's data
+// to be independently managed and deleted without affecting other chains.
+//
+// Directory structure:
+//   {dbPath}/{networkID}/{dbVersion}/{chainID}/
+//
+// Note: P-chain uses ids.Empty as its chain ID, which is valid.
+//
+// Returns a metered database instance for the chain.
+func (n *Node) createChainDatabase(chainID ids.ID) (database.Database, error) {
+
+	// Determine base database folder based on database type
+	var dbFolderName string
+	switch n.Config.DatabaseConfig.Name {
+	case leveldb.Name:
+		dbFolderName = version.CurrentDatabase
+	case pebbledb.Name:
+		dbFolderName = "pebble"
+	default:
+		dbFolderName = "db"
+	}
+
+	// Build per-chain database path:
+	// {dbPath}/{dbFolderName}/{chainID}
+	basePath := filepath.Join(n.Config.DatabaseConfig.Path, dbFolderName)
+	chainDBPath := filepath.Join(basePath, chainID.String())
+
+	// Create metrics registry for this chain's database
+	chainDBMetricName := fmt.Sprintf("db_chain_%s", chainID)
+	dbReg, err := metrics.MakeAndRegister(
+		n.MeterDBMetricsGatherer,
+		chainDBMetricName,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create metrics registry for chain %s: %w", chainID, err)
+	}
+
+	// Create the per-chain database
+	// Note: databasefactory.New already wraps the database with meterdb, so we return it directly
+	chainDB, err := databasefactory.New(
+		n.Config.DatabaseConfig.Name,
+		chainDBPath,
+		n.Config.DatabaseConfig.ReadOnly,
+		n.Config.DatabaseConfig.Config,
+		dbReg,
+		n.Log,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't create database for chain %s at path %s: %w", chainID, chainDBPath, err)
+	}
+
+	n.Log.Info("created per-chain database",
+		zap.Stringer("chainID", chainID),
+		zap.String("path", chainDBPath),
+	)
+
+	return chainDB, nil
+}
+
 // Set the node IDs of the peers this node should first connect to
 func (n *Node) initBootstrappers() error {
 	n.bootstrappers = validators.NewManager()
@@ -1040,6 +1101,7 @@ func (n *Node) initAPIServer() error {
 		apiRegisterer,
 		n.Config.HTTPConfig.HTTPConfig,
 		n.Config.HTTPAllowedHosts,
+		server.DefaultRPCCacheConfig(), // Enable RPC caching with defaults
 	)
 	return err
 }
@@ -1130,6 +1192,15 @@ func (n *Node) initChainManager(avaxAssetID ids.ID) error {
 		return fmt.Errorf("failed to initialize subnets: %w", err)
 	}
 
+	// Determine if per-chain database isolation should be used
+	var createChainDBFunc func(ids.ID) (database.Database, error)
+	if n.Config.DatabaseConfig.UsePerChainDatabases {
+		createChainDBFunc = n.createChainDatabase
+		n.Log.Info("per-chain database isolation enabled")
+	} else {
+		n.Log.Info("using legacy shared database with chain ID prefixing")
+	}
+
 	n.chainManager, err = chains.New(
 		&chains.ManagerConfig{
 			SybilProtectionEnabled:                  n.Config.SybilProtectionEnabled,
@@ -1177,6 +1248,7 @@ func (n *Node) initChainManager(avaxAssetID ids.ID) error {
 			Tracer:                                  n.tracer,
 			ChainDataDir:                            n.Config.ChainDataDir,
 			Subnets:                                 subnets,
+			CreateChainDB:                           createChainDBFunc,
 		},
 	)
 	if err != nil {
@@ -1202,8 +1274,9 @@ func (n *Node) initVMs() error {
 	}
 
 	// Register the VMs that Avalanche supports
+	// Use background context for VM factory registration during node initialization
 	err := errors.Join(
-		n.VMManager.RegisterFactory(context.TODO(), constants.PlatformVMID, &platformvm.Factory{
+		n.VMManager.RegisterFactory(context.Background(), constants.PlatformVMID, &platformvm.Factory{
 			Internal: platformconfig.Internal{
 				Chains:                    n.chainManager,
 				Validators:                vdrs,
@@ -1225,14 +1298,14 @@ func (n *Node) initVMs() error {
 				UseCurrentHeight:          n.Config.UseCurrentHeight,
 			},
 		}),
-		n.VMManager.RegisterFactory(context.TODO(), constants.AVMID, &avm.Factory{
+		n.VMManager.RegisterFactory(context.Background(), constants.AVMID, &avm.Factory{
 			Config: avmconfig.Config{
 				Upgrades:         n.Config.UpgradeConfig,
 				TxFee:            n.Config.TxFee,
 				CreateAssetTxFee: n.Config.CreateAssetTxFee,
 			},
 		}),
-		n.VMManager.RegisterFactory(context.TODO(), constants.EVMID, &coreth.Factory{}),
+		n.VMManager.RegisterFactory(context.Background(), constants.EVMID, &coreth.Factory{}),
 	)
 	if err != nil {
 		return err
@@ -1260,7 +1333,7 @@ func (n *Node) initVMs() error {
 	})
 
 	// register any vms that need to be installed as plugins from disk
-	_, failedVMs, err := n.VMRegistry.Reload(context.TODO())
+	_, failedVMs, err := n.VMRegistry.Reload(context.Background())
 	for failedVM, err := range failedVMs {
 		n.Log.Error("failed to register VM",
 			zap.Stringer("vmID", failedVM),
@@ -1888,7 +1961,9 @@ func (n *Node) shutdown() {
 
 	// Ensure all runtimes are shutdown
 	n.Log.Info("cleaning up plugin runtimes")
-	n.runtimeManager.Stop(context.TODO())
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), n.Config.ShutdownTimeout)
+	defer shutdownCancel()
+	n.runtimeManager.Stop(shutdownCtx)
 
 	if n.DB != nil {
 		if err := n.DB.Delete(ungracefulShutdown); err != nil {

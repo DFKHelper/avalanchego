@@ -785,13 +785,32 @@ func (vm *VM) SetState(_ context.Context, state snow.State) error {
 // onBootstrapStarted marks this VM as bootstrapping
 func (vm *VM) onBootstrapStarted() error {
 	vm.bootstrapped.Set(false)
+
+	// Note: Corrupted state detection now happens in GetOngoingSyncStateSummary()
+	// which runs earlier in the boot sequence, before the engine decides to resume.
+
 	if err := vm.Client.Error(); err != nil {
-		return err
+		// errStateSyncFallback is not a real error - it indicates successful cleanup
+		// after stuck detection, and bootstrapping should continue with block sync.
+		if !errors.Is(err, vmsync.ErrStateSyncFallback()) {
+			return err
+		}
+		log.Info("State sync fallback completed, continuing with block sync")
+
+		// CRITICAL: Preserve summary for reviver when falling back
+		// The reviver needs the summary to detect resumable state and retry in 30 minutes
+		// Summary will be cleared in onNormalOperationsStarted() after successful block sync
+		log.Info("Preserving state sync summary for reviver retry mechanism")
+	} else {
+		// State sync succeeded - clear the summary immediately
+		// No need to preserve it since sync completed successfully
+		log.Info("State sync succeeded, clearing summary")
+		if err := vm.Client.ClearOngoingSummary(); err != nil {
+			log.Warn("Failed to clear summary after state sync success (non-fatal)", "err", err)
+			// Don't fail bootstrap for this - summary will be cleaned up later
+		}
 	}
-	// After starting bootstrapping, do not attempt to resume a previous state sync.
-	if err := vm.Client.ClearOngoingSummary(); err != nil {
-		return err
-	}
+
 	// Ensure snapshots are initialized before bootstrapping (i.e., if state sync is skipped).
 	// Note calling this function has no effect if snapshots are already initialized.
 	vm.blockChain.InitializeSnapshots()
@@ -804,6 +823,19 @@ func (vm *VM) onNormalOperationsStarted() error {
 		return nil
 	}
 	vm.bootstrapped.Set(true)
+
+	// CRITICAL: Clear any remaining state sync summary after successful bootstrap
+	// This prevents stale state sync metadata from causing unwanted retries on next restart
+	// The summary is preserved during fallback to allow reviver to work, but must be
+	// cleaned up once we've successfully bootstrapped via block sync
+	if err := vm.Client.ClearOngoingSummary(); err != nil {
+		log.Warn("Failed to clear state sync summary after bootstrap completion",
+			"err", err)
+		// Don't fail the entire bootstrap for this - just log the warning
+		// The summary will be validated/cleared on next restart if corrupted
+	} else {
+		log.Info("Cleared state sync summary after successful bootstrap completion")
+	}
 
 	ctx, cancel := context.WithCancel(context.TODO())
 	vm.cancel = cancel

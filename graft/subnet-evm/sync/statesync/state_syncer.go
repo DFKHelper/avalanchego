@@ -7,14 +7,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"runtime/debug"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/ethdb"
+	"github.com/ava-labs/libevm/log"
 	"github.com/ava-labs/libevm/triedb"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/ava-labs/avalanchego/graft/evm/core/state/snapshot"
+	"github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm/customrawdb"
 
 	syncclient "github.com/ava-labs/avalanchego/graft/subnet-evm/sync/client"
 )
@@ -24,9 +31,44 @@ const (
 	numStorageTrieSegments = 4
 	numMainTrieSegments    = 8
 	defaultNumWorkers      = 8
+
+	// Request size bounds - prevents misconfiguration
+	minRequestSize = 16    // Too small causes excessive round trips
+	maxRequestSize = 10240 // Too large can cause timeouts and memory issues
+
+	// Reviver retry limits - prevents infinite restart loops
+	// If state sync fails 5 times, something is fundamentally wrong (peer set, network, etc.)
+	maxRestartAttempts = 5
 )
 
-var errWaitBeforeStart = errors.New("cannot call Wait before Start")
+var (
+	errWaitBeforeStart     = errors.New("cannot call Wait before Start")
+	errStateSyncStuck      = errors.New("state sync stuck, fallback to block sync required")
+	errInvalidRequestSize  = errors.New("request size must be between 16 and 10240")
+	errInvalidWorkerConfig = errors.New("NumCodeFetchingWorkers must be positive")
+)
+
+// ErrStateSyncStuck returns the sentinel error for stuck state sync detection.
+// This allows external packages to check for this specific error condition.
+func ErrStateSyncStuck() error {
+	return errStateSyncStuck
+}
+
+// calculateOptimalWorkers determines the optimal number of sync workers based on available CPU cores.
+// Uses 75% of available cores to leave headroom for other operations (networking, database, etc.).
+// Enforces minimum of 4 workers and maximum of 32 to prevent under/over-utilization.
+func calculateOptimalWorkers() int {
+	cores := runtime.NumCPU()
+	// Use 75% of cores, minimum 4, maximum 32
+	workers := cores * 3 / 4
+	if workers < 4 {
+		workers = 4
+	}
+	if workers > 32 {
+		workers = 32
+	}
+	return workers
+}
 
 type StateSyncerConfig struct {
 	Root                     common.Hash
@@ -35,16 +77,24 @@ type StateSyncerConfig struct {
 	BatchSize                int
 	MaxOutstandingCodeHashes int    // Maximum number of code hashes in the code syncer queue
 	NumCodeFetchingWorkers   int    // Number of code syncing threads
+	NumWorkers               int    // Number of concurrent sync workers (0 = auto-calculate based on CPU cores)
 	RequestSize              uint16 // Number of leafs to request from a peer at a time
 }
 
 // stateSync keeps the state of the entire state sync operation.
 type stateSync struct {
-	db        ethdb.Database            // database we are syncing
-	root      common.Hash               // root of the EVM state we are syncing to
-	trieDB    *triedb.Database          // trieDB on top of db we are syncing. used to restore any existing tries.
-	snapshot  snapshot.SnapshotIterable // used to access the database we are syncing as a snapshot.
-	batchSize int                       // write batches when they reach this size
+	db         ethdb.Database            // database we are syncing
+	root       common.Hash               // root of the EVM state we are syncing to
+	trieDB     *triedb.Database          // trieDB on top of db we are syncing. used to restore any existing tries.
+	snapshot   snapshot.SnapshotIterable // used to access the database we are syncing as a snapshot.
+	batchSize  int                       // write batches when they reach this size
+	numWorkers int                       // number of concurrent sync workers
+
+	// Config values needed for Restart()
+	client                   syncclient.Client
+	requestSize              uint16
+	maxOutstandingCodeHashes int
+	numCodeFetchingWorkers   int
 
 	segments   chan syncclient.LeafSyncTask   // channel of tasks to sync
 	syncer     *syncclient.CallbackLeafSyncer // performs the sync, looping over each task's range and invoking specified callbacks
@@ -58,18 +108,70 @@ type stateSync struct {
 	lock            sync.RWMutex
 	triesInProgress map[common.Hash]*trieToSync
 
+	// Mutex to protect Start() and Restart() from running concurrently
+	// This prevents race conditions between manual state sync and reviver-triggered restarts
+	syncMutex sync.Mutex
+
 	// track completion and progress of work
 	mainTrieDone       chan struct{}
 	storageTriesDone   chan struct{}
 	triesInProgressSem chan struct{}
 	done               chan error
 	stats              *trieSyncStats
+	stuckDetector      *StuckDetector // monitors for stalled sync and triggers fallback
 
 	// context cancellation management
-	cancelFunc context.CancelFunc
+	cancelFunc           context.CancelFunc
+	started              atomic.Bool   // prevents multiple Start() calls
+	waitStarted          atomic.Bool   // prevents multiple Wait() calls
+	cachedResult         atomic.Value  // stores *error from first Wait() call for reuse
+	resultReady          chan struct{} // closed when cachedResult is available
+	mainTrieDoneOnce     sync.Once     // ensures mainTrieDone channel is closed only once
+	segmentsDoneOnce     sync.Once     // ensures segments channel is closed only once
+	storageTriesDoneOnce sync.Once     // ensures storageTriesDone channel is closed only once
+
+	// Code sync error tracking for reviver retry
+	// Allows storage tries to complete even when code sync fails
+	codeSyncErr    atomic.Value // stores *error from code sync
+	codeSyncFailed atomic.Bool  // true if code sync failed but storage completed
+
+	// Reviver retry tracking to prevent infinite loops
+	restartCount atomic.Uint32 // number of times Restart() has been called
 }
 
 func NewStateSyncer(config *StateSyncerConfig) (*stateSync, error) {
+	// Validate configuration
+	if config.RequestSize < minRequestSize || config.RequestSize > maxRequestSize {
+		return nil, fmt.Errorf("%w: got %d", errInvalidRequestSize, config.RequestSize)
+	}
+	if config.NumCodeFetchingWorkers <= 0 {
+		return nil, errInvalidWorkerConfig
+	}
+
+	// Determine number of workers: use config value if specified, otherwise calculate based on CPU cores
+	numWorkers := config.NumWorkers
+	if numWorkers <= 0 {
+		numWorkers = calculateOptimalWorkers()
+		log.Info("Auto-calculated optimal worker count", "workers", numWorkers, "cpuCores", runtime.NumCPU())
+	} else {
+		// Validate configured worker count to prevent excessive resource allocation
+		if numWorkers > 128 {
+			log.Warn("Configured worker count exceeds recommended maximum, capping at 128",
+				"configured", numWorkers, "capped", 128)
+			numWorkers = 128
+		}
+		log.Info("Using configured worker count", "workers", numWorkers)
+	}
+
+	// CRITICAL: Enforce minimum worker count to prevent deadlock
+	// With numWorkers < 2, if the main trie holds the semaphore, storage tries can't be processed
+	// This causes a deadlock where main trie waits for storage tries, but storage tries can't start
+	if numWorkers < 2 {
+		log.Warn("Worker count too low, enforcing minimum of 2 to prevent deadlock",
+			"configured", numWorkers, "enforced", 2)
+		numWorkers = 2
+	}
+
 	ss := &stateSync{
 		batchSize:       config.BatchSize,
 		db:              config.DB,
@@ -78,19 +180,35 @@ func NewStateSyncer(config *StateSyncerConfig) (*stateSync, error) {
 		snapshot:        snapshot.NewDiskLayer(config.DB),
 		stats:           newTrieSyncStats(),
 		triesInProgress: make(map[common.Hash]*trieToSync),
+		numWorkers:      numWorkers,
+
+		// Store config values for Restart()
+		client:                   config.Client,
+		requestSize:              config.RequestSize,
+		maxOutstandingCodeHashes: config.MaxOutstandingCodeHashes,
+		numCodeFetchingWorkers:   config.NumCodeFetchingWorkers,
 
 		// [triesInProgressSem] is used to keep the number of tries syncing
-		// less than or equal to [defaultNumWorkers].
-		triesInProgressSem: make(chan struct{}, defaultNumWorkers),
+		// less than or equal to [numWorkers].
+		triesInProgressSem: make(chan struct{}, numWorkers),
 
 		// Each [trieToSync] will have a maximum of [numSegments] segments.
-		// We set the capacity of [segments] such that [defaultNumWorkers]
+		// We set the capacity of [segments] such that [numWorkers]
 		// storage tries can sync concurrently.
-		segments:         make(chan syncclient.LeafSyncTask, defaultNumWorkers*numStorageTrieSegments),
+		segments:         make(chan syncclient.LeafSyncTask, numWorkers*numStorageTrieSegments),
 		mainTrieDone:     make(chan struct{}),
 		storageTriesDone: make(chan struct{}),
 		done:             make(chan error, 1),
+		resultReady:      make(chan struct{}),
 	}
+
+	// Initialize stuck detector to monitor sync progress
+	ss.stuckDetector = NewStuckDetector(ss.stats)
+	if ss.stuckDetector == nil {
+		return nil, errors.New("failed to create stuck detector")
+	}
+	log.Info("Stuck detector created successfully")
+
 	ss.syncer = syncclient.NewCallbackLeafSyncer(config.Client, ss.segments, config.RequestSize)
 	ss.codeSyncer = newCodeSyncer(CodeSyncerConfig{
 		DB:                       config.DB,
@@ -130,8 +248,10 @@ func (t *stateSync) onStorageTrieFinished(root common.Hash) error {
 	if numInProgress == 0 {
 		select {
 		case <-t.storageTriesDone:
-			// when the last storage trie finishes, close the segments channel
-			close(t.segments)
+			// when the last storage trie finishes, close the segments channel (safe to call multiple times)
+			t.segmentsDoneOnce.Do(func() {
+				close(t.segments)
+			})
 		default:
 		}
 	}
@@ -149,8 +269,10 @@ func (t *stateSync) onMainTrieFinished() error {
 	}
 	t.stats.setTriesRemaining(numStorageTries)
 
-	// mark the main trie done
-	close(t.mainTrieDone)
+	// mark the main trie done (safe to call multiple times)
+	t.mainTrieDoneOnce.Do(func() {
+		close(t.mainTrieDone)
+	})
 	_, err = t.removeTrieInProgress(t.root)
 	return err
 }
@@ -189,7 +311,9 @@ func (t *stateSync) storageTrieProducer(ctx context.Context) error {
 		}
 		// If there are no storage tries, then root will be the empty hash on the first pass.
 		if root == (common.Hash{}) && !more {
-			close(t.segments)
+			t.segmentsDoneOnce.Do(func() {
+				close(t.segments)
+			})
 			return nil
 		}
 
@@ -212,7 +336,9 @@ func (t *stateSync) storageTrieProducer(ctx context.Context) error {
 		}
 		t.addTrieInProgress(root, storageTrie)
 		if !more {
-			close(t.storageTriesDone)
+			t.storageTriesDoneOnce.Do(func() {
+				close(t.storageTriesDone)
+			})
 		}
 		// start syncing after tracking the trie as in progress
 		storageTrie.startSyncing()
@@ -223,33 +349,299 @@ func (t *stateSync) storageTrieProducer(ctx context.Context) error {
 	}
 }
 
+// ErrorCategory classifies state sync errors
+type ErrorCategory int
+
+const (
+	ErrorCategoryTransient ErrorCategory = iota // Temporary network/peer issues
+	ErrorCategoryRetryable                      // Peer unavailability, worth retrying (preserve state for reviver)
+	ErrorCategoryFatal                          // Unrecoverable (DB corruption, invalid state)
+	ErrorCategoryStuck                          // Progress stalled, needs fallback
+)
+
+// categorizeStateSyncError classifies errors to determine appropriate action
+func categorizeStateSyncError(err error) ErrorCategory {
+	if err == nil {
+		return ErrorCategoryTransient
+	}
+
+	errStr := err.Error()
+
+	// Stuck detection (explicit)
+	if errors.Is(err, errStateSyncStuck) {
+		return ErrorCategoryStuck
+	}
+
+	// Fatal errors (don't fallback, require intervention)
+	if strings.Contains(errStr, "database") && strings.Contains(errStr, "corrupt") {
+		return ErrorCategoryFatal
+	}
+
+	if strings.Contains(errStr, "panic") {
+		return ErrorCategoryFatal
+	}
+
+	// IMPORTANT: Distinguish code sync failures from other retry exhaustion
+	// Code sync failures are peer-related (peers don't have data), not stuck
+	// Check for code sync specific error patterns first, before general retry exhaustion
+	if strings.Contains(errStr, "code request") ||
+		strings.Contains(errStr, "CodeRequest") ||
+		strings.Contains(errStr, "code sync") ||
+		strings.Contains(errStr, "code hashes") {
+
+		// Code sync failures with retry exhaustion are retryable (not stuck)
+		if strings.Contains(errStr, "too many retries") ||
+			strings.Contains(errStr, "retry exhaustion") ||
+			strings.Contains(errStr, " retries") {
+			log.Warn("Code sync retry exhaustion - preserving state for reviver",
+				"error", errStr)
+			return ErrorCategoryRetryable
+		}
+
+		// Other code sync errors (timeouts, peer unavailable, etc.) are also retryable
+		log.Warn("Code sync error detected - preserving state for reviver",
+			"error", errStr)
+		return ErrorCategoryRetryable
+	}
+
+	// Other retry exhaustion (trie segments, etc.) is stuck, not retryable
+	if strings.Contains(errStr, "too many retries") {
+		return ErrorCategoryStuck
+	}
+
+	// Other stuck indicators
+	if strings.Contains(errStr, "no leafs fetched") ||
+		strings.Contains(errStr, "no trie completed") {
+		return ErrorCategoryStuck
+	}
+
+	// Context cancellation is transient
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return ErrorCategoryTransient
+	}
+
+	// Everything else is transient
+	return ErrorCategoryTransient
+}
+
+// shouldFallbackToBlockSync determines if we should fallback based on error
+func shouldFallbackToBlockSync(err error) bool {
+	category := categorizeStateSyncError(err)
+	// Fallback for both Stuck and Retryable errors
+	// The key difference: Retryable preserves summary for reviver, Stuck may not
+	return category == ErrorCategoryStuck || category == ErrorCategoryRetryable
+}
+
 func (t *stateSync) Start(ctx context.Context) error {
+	// CRITICAL: Acquire syncMutex to prevent concurrent Start()/Restart() calls
+	// This ensures mutual exclusion between manual state sync and reviver retries
+	t.syncMutex.Lock()
+	defer t.syncMutex.Unlock()
+
+	// Prevent multiple Start() calls
+	if !t.started.CompareAndSwap(false, true) {
+		return errors.New("state sync already started")
+	}
+
+	return t.doStart(ctx)
+}
+
+// doStart contains the core Start() logic without mutex acquisition.
+// This method should only be called while holding syncMutex.
+// Separated to allow Restart() to call it without causing deadlock.
+func (t *stateSync) doStart(ctx context.Context) error {
 	// Create a cancellable context for the sync operations
 	syncCtx, cancel := context.WithCancel(ctx)
 	t.cancelFunc = cancel
 
+	// Start stuck detector to monitor for stalled sync
+	log.Info("Starting stuck detector for state sync monitoring")
+	t.stuckDetector.Start(syncCtx)
+
 	// Start the code syncer and leaf syncer.
 	eg, egCtx := errgroup.WithContext(syncCtx)
 	t.codeSyncer.start(egCtx) // start the code syncer first since the leaf syncer may add code tasks
-	t.syncer.Start(egCtx, defaultNumWorkers, t.onSyncFailure)
-	eg.Go(func() error {
-		if err := <-t.syncer.Done(); err != nil {
-			return err
+	t.syncer.Start(egCtx, t.numWorkers, t.onSyncFailure)
+
+	// Wrap all goroutines with panic recovery
+	// CRITICAL: recover() must be called directly in defer, not in a helper function
+	eg.Go(func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("PANIC in syncer.Done goroutine, triggering fallback",
+					"panic", r,
+					"stack", string(debug.Stack()))
+				cancel() // Cancel other goroutines
+				err = fmt.Errorf("panic in syncer.Done: %v", r)
+			}
+		}()
+
+		syncErr := <-t.syncer.Done()
+
+		// If panic occurred, err is already set - return it immediately
+		if err != nil {
+			return err // Return panic error
+		}
+
+		if syncErr != nil {
+			return syncErr
 		}
 		return t.onSyncComplete()
 	})
-	eg.Go(func() error {
-		err := <-t.codeSyncer.Done()
-		return err
+
+	eg.Go(func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("PANIC in codeSyncer.Done goroutine",
+					"panic", r,
+					"stack", string(debug.Stack()))
+				// Don't cancel - let storage tries finish, but still fail the sync
+				// Panics are programming bugs, not "code unavailable" scenarios
+				err = fmt.Errorf("panic in codeSyncer.Done: %v", r)
+			}
+		}()
+
+		codeSyncErr := <-t.codeSyncer.Done()
+
+		// If panic occurred, err is already set - don't overwrite it
+		if err != nil {
+			return err // Return panic error
+		}
+
+		if codeSyncErr != nil {
+			// Context cancelled is expected during shutdown
+			if errors.Is(codeSyncErr, context.Canceled) {
+				return codeSyncErr
+			}
+
+			// CRITICAL FIX: Code sync failure MUST prevent final commit
+			//
+			// Storage tries write their batches incrementally (for memory efficiency),
+			// but the main trie batch.Write() at line 277 serves as the atomic "commit marker".
+			// If we return nil here and allow onSyncComplete() to commit the main trie,
+			// the database will be in a committed state with missing contract code.
+			// This breaks contract execution - accounts will reference codeHash for non-existent code.
+			//
+			// By returning an error here:
+			// 1. onSyncComplete() won't be called (main trie batch not written)
+			// 2. Already-fetched storage trie data is preserved in the database
+			// 3. Fallback to block sync is triggered
+			// 4. Reviver can retry and only fetch the missing code (storage tries already exist)
+			//
+			// This is categorized as ErrorCategoryRetryable (not stuck) so reviver will retry.
+			log.Error("Code sync failed - preventing state commit to avoid incomplete state",
+				"err", codeSyncErr,
+				"triesSynced", t.stats.getProgress())
+
+			// Store the error for categorization and diagnostics
+			t.storeCodeSyncError(codeSyncErr)
+
+			// Return wrapped error to prevent commit
+			return fmt.Errorf("code sync failed (state preserved for retry): %w", codeSyncErr)
+		}
+
+		log.Info("Code sync completed successfully")
+		return nil
 	})
+
+	eg.Go(func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("PANIC in storageTrieProducer goroutine, triggering fallback",
+					"panic", r,
+					"stack", string(debug.Stack()))
+				cancel() // Cancel other goroutines
+				err = fmt.Errorf("panic in storageTrieProducer: %v", r)
+			}
+		}()
+
+		producerErr := t.storageTrieProducer(egCtx)
+
+		// If panic occurred, err is already set - return it immediately
+		if err != nil {
+			return err // Return panic error
+		}
+
+		return producerErr
+	})
+
+	// Monitor for stuck detection alongside sync operations
 	eg.Go(func() error {
-		return t.storageTrieProducer(egCtx)
+		select {
+		case <-t.stuckDetector.StuckChannel():
+			// Log final state before canceling
+			triesSynced, triesRemaining := t.stats.getProgress()
+			log.Warn("Stuck detected, canceling state sync to trigger fallback",
+				"triesSynced", triesSynced,
+				"triesRemaining", triesRemaining,
+				"totalLeafs", t.stats.totalLeafs.Snapshot().Count())
+			cancel() // Cancel sync to trigger fallback
+			return errStateSyncStuck
+		case <-egCtx.Done():
+			return nil // Normal completion or cancellation
+		}
+	})
+
+	// Monitor for code sync phase to enable faster stuck detection
+	eg.Go(func() error {
+		// Wait for main trie and storage tries to complete
+		select {
+		case <-t.mainTrieDone:
+			// Main trie done, now wait for storage tries
+			select {
+			case <-t.storageTriesDone:
+				// Both done, now primarily in code sync phase
+				t.stuckDetector.EnterCodeSyncPhase()
+				// Notify that storage tries are waiting for code sync to complete
+				// This enables faster stuck detection if code sync fails
+				t.stuckDetector.NotifyStorageTriesWaitingForCode()
+			case <-egCtx.Done():
+				return nil
+			}
+		case <-egCtx.Done():
+			return nil
+		}
+
+		// Wait for completion or cancellation
+		<-egCtx.Done()
+		t.stuckDetector.ExitCodeSyncPhase()
+		t.stuckDetector.ClearStorageTriesWaiting()
+		return nil
 	})
 
 	// The errgroup wait will take care of returning the first error that occurs, or returning
-	// nil if both finish without an error.
+	// nil if all finish without an error.
 	go func() {
-		t.done <- eg.Wait()
+		err := eg.Wait()
+		t.stuckDetector.Stop() // Stop monitoring when sync completes or fails
+
+		// Categorize error and trigger appropriate fallback
+		if err != nil && !errors.Is(err, context.Canceled) {
+			if shouldFallbackToBlockSync(err) {
+				log.Warn("State sync error requires fallback to block sync",
+					"err", err,
+					"errType", categorizeStateSyncError(err))
+
+				// Persist state sync failure to enable resume from block sync
+				// This allows the node to recover progress if it restarts during block sync
+				if persistErr := t.persistStateSyncFailure(); persistErr != nil {
+					log.Warn("Failed to persist state sync failure, continuing anyway",
+						"err", persistErr)
+				}
+
+				err = errStateSyncStuck
+			}
+		}
+
+		// On successful completion, clear sync mode markers
+		if err == nil {
+			if clearErr := customrawdb.DeleteSyncMode(t.db); clearErr != nil {
+				log.Warn("Failed to clear sync mode after successful state sync",
+					"err", clearErr)
+			}
+		}
+
+		t.done <- err
 	}()
 	return nil
 }
@@ -260,14 +652,186 @@ func (t *stateSync) Wait(ctx context.Context) error {
 		return errWaitBeforeStart
 	}
 
+	// Check if Wait() was already called - return cached result
+	if !t.waitStarted.CompareAndSwap(false, true) {
+		// Another goroutine already called Wait() - wait for result to be ready
+		<-t.resultReady // Block until first Wait() completes and closes this channel
+
+		// Now safe to load cached result
+		result := t.cachedResult.Load()
+		if result == nil {
+			return errors.New("internal error: resultReady closed but cachedResult is nil")
+		}
+
+		// Safe type assertion with comma-ok pattern
+		errPtr, ok := result.(*error)
+		if !ok {
+			return errors.New("internal error: cachedResult has wrong type")
+		}
+		return *errPtr
+	}
+
+	var resultErr error
 	select {
 	case err := <-t.done:
-		return err
+		resultErr = err
 	case <-ctx.Done():
 		t.cancelFunc() // cancel the sync operations if the context is done
 		<-t.done       // wait for the sync operations to finish
-		return ctx.Err()
+		resultErr = ctx.Err()
 	}
+
+	// Cache the result for future Wait() calls and signal they can proceed
+	t.cachedResult.Store(&resultErr)
+	close(t.resultReady) // Signal that result is now available
+	return resultErr
+}
+
+// Restart reinitializes the state syncer for a retry attempt after fallback.
+// Called by the reviver mechanism when automatically retrying failed state sync.
+// The startReqID ensures message IDs don't conflict with previous attempts.
+//
+// IMPORTANT: Only call after Start() has completed and Wait() has returned.
+// The concurrency guards (sync.Once, cachedResult) prevent issues from multiple calls.
+// This method recreates all channels, workers, and internal state for a fresh start.
+func (t *stateSync) Restart(ctx context.Context, startReqID uint32) error {
+	// CRITICAL: Acquire syncMutex to prevent concurrent Start()/Restart() calls
+	// This ensures mutual exclusion between manual state sync and reviver retries
+	t.syncMutex.Lock()
+	defer t.syncMutex.Unlock()
+
+	// CRITICAL: Check restart count to prevent infinite retry loops
+	// If state sync has failed maxRestartAttempts times, something is fundamentally wrong
+	// (e.g., all peers are unresponsive, network issues, malicious peers withholding data)
+	// Continuing to retry would waste resources and delay fallback to block sync
+	currentRestartCount := t.restartCount.Add(1) // Atomically increment and get new value
+	if currentRestartCount > maxRestartAttempts {
+		log.Error("Reviver restart limit exceeded - giving up on state sync",
+			"restartCount", currentRestartCount,
+			"maxRestartAttempts", maxRestartAttempts,
+			"recommendation", "Node will fallback to block sync")
+		return fmt.Errorf("restart limit exceeded (%d > %d): giving up on state sync",
+			currentRestartCount, maxRestartAttempts)
+	}
+
+	log.Warn("Reviver retry attempt",
+		"restartCount", currentRestartCount,
+		"maxRestartAttempts", maxRestartAttempts)
+
+	// Check if a sync is currently running
+	if t.started.Load() {
+		return errors.New("cannot restart: state sync already running")
+	}
+
+	// CRITICAL: Verify Wait() was called before Restart()
+	// Restart() requires that the previous sync completed and Wait() returned
+	// Otherwise we could have abandoned channels with blocked goroutines
+	if !t.waitStarted.Load() {
+		return errors.New("cannot restart: Wait() must be called before Restart()")
+	}
+
+	log.Warn("===========================================")
+	log.Warn("STATE SYNC RESTART REQUESTED BY REVIVER")
+	log.Warn("===========================================",
+		"startReqID", startReqID,
+		"root", t.root.Hex())
+
+	// Reset atomic state flags
+	t.started.Store(false)
+	t.waitStarted.Store(false)
+
+	// CRITICAL: Cancel old context to stop any lingering goroutines
+	// This prevents goroutine leaks from failed previous attempts
+	if t.cancelFunc != nil {
+		log.Info("Cancelling previous state sync context to cleanup goroutines")
+		t.cancelFunc() // Cancel old context first
+
+		// Wait for previous sync to fully cleanup
+		// The done channel will be closed when all goroutines exit
+		select {
+		case <-t.done:
+			log.Info("Previous state sync cleanup completed")
+		case <-time.After(10 * time.Second):
+			log.Warn("Timeout waiting for previous sync cleanup, proceeding anyway")
+		}
+	}
+	t.cancelFunc = nil
+
+	// Recreate all channels (old ones are closed)
+	t.done = make(chan error, 1)
+	t.resultReady = make(chan struct{})
+	t.mainTrieDone = make(chan struct{})
+	t.storageTriesDone = make(chan struct{})
+
+	// CRITICAL: Recreate segments channel (old one was closed)
+	// Must have same capacity as original (numWorkers * numStorageTrieSegments)
+	t.segments = make(chan syncclient.LeafSyncTask, t.numWorkers*numStorageTrieSegments)
+
+	// CRITICAL: Recreate triesInProgressSem (semaphore may be exhausted from previous run)
+	t.triesInProgressSem = make(chan struct{}, t.numWorkers)
+
+	// Reset the Once guards so channels can be closed again
+	t.mainTrieDoneOnce = sync.Once{}
+	t.segmentsDoneOnce = sync.Once{}
+	t.storageTriesDoneOnce = sync.Once{}
+
+	// CRITICAL: Recreate syncer with new segments channel
+	// The old syncer holds a reference to the closed segments channel
+	t.syncer = syncclient.NewCallbackLeafSyncer(t.client, t.segments, t.requestSize)
+
+	// CRITICAL: Recreate codeSyncer to reset its internal state
+	// The old codeSyncer may have stale code hashes or error state
+	t.codeSyncer = newCodeSyncer(CodeSyncerConfig{
+		DB:                       t.db,
+		Client:                   t.client,
+		MaxOutstandingCodeHashes: t.maxOutstandingCodeHashes,
+		NumCodeFetchingWorkers:   t.numCodeFetchingWorkers,
+	})
+
+	// Clear triesInProgress map (stale references from previous run)
+	t.lock.Lock()
+	t.triesInProgress = make(map[common.Hash]*trieToSync)
+	t.lock.Unlock()
+
+	// Reset stats for fresh monitoring of this retry attempt
+	// Stuck detector relies on rate calculations, so we need fresh stats
+	t.stats = newTrieSyncStats()
+
+	// Verify trieQueue root matches (should match because we preserved summary)
+	if err := t.trieQueue.clearIfRootDoesNotMatch(t.root); err != nil {
+		log.Error("REVIVER: trieQueue root mismatch during restart", "err", err)
+		return fmt.Errorf("trieQueue root mismatch: %w", err)
+	}
+
+	// CRITICAL: Recreate mainTrie (old one has stale state)
+	var err error
+	t.mainTrie, err = NewTrieToSync(t, t.root, common.Hash{}, NewMainTrieTask(t))
+	if err != nil {
+		log.Error("REVIVER: Failed to create mainTrie during restart", "err", err)
+		return fmt.Errorf("failed to create mainTrie: %w", err)
+	}
+
+	// Track mainTrie as in progress and start syncing
+	t.addTrieInProgress(t.root, t.mainTrie)
+	t.mainTrie.startSyncing()
+
+	// Reset stuck detector to monitor the new sync attempt (uses fresh stats)
+	t.stuckDetector = NewStuckDetector(t.stats)
+
+	log.Info("State sync restart initialized, calling doStart()...")
+
+	// Start the sync again - this will use the preserved summary
+	// CRITICAL: Call doStart() directly (not Start()) to avoid deadlock
+	// We already hold syncMutex, and Start() would try to acquire it again
+	err = t.doStart(ctx)
+	if err != nil {
+		log.Error("REVIVER: Restart failed during doStart()",
+			"err", err)
+		return fmt.Errorf("restart start failed: %w", err)
+	}
+
+	log.Warn("REVIVER: State sync restart initiated successfully")
+	return nil
 }
 
 // addTrieInProgress tracks the root as being currently synced.
@@ -306,5 +870,52 @@ func (t *stateSync) onSyncFailure(error) error {
 			}
 		}
 	}
+	return nil
+}
+
+// storeCodeSyncError stores a code sync error for potential retry by the reviver.
+// This allows storage tries to complete even when code sync fails, with the error
+// preserved for a subsequent retry attempt.
+func (t *stateSync) storeCodeSyncError(err error) {
+	if err != nil {
+		// Store error first, then set flag (ordering matters for concurrent access)
+		t.codeSyncErr.Store(err)
+		t.codeSyncFailed.Store(true)
+		log.Warn("Code sync error stored for potential reviver retry", "err", err)
+	}
+}
+
+// getCodeSyncError retrieves the stored code sync error, if any.
+// Returns nil if no code sync error was stored.
+func (t *stateSync) getCodeSyncError() error {
+	if !t.codeSyncFailed.Load() {
+		return nil
+	}
+	errVal := t.codeSyncErr.Load()
+	if errVal == nil {
+		return nil
+	}
+	// Safe type assertion with ok check for defensive programming
+	if err, ok := errVal.(error); ok {
+		return err
+	}
+	// Should never happen, but return nil instead of panicking
+	log.Error("BUG: codeSyncErr contains non-error type", "type", fmt.Sprintf("%T", errVal))
+	return nil
+}
+
+// persistStateSyncFailure saves state sync progress to enable resumption via block sync.
+// This is called when state sync fails and will fall back to block sync.
+// The persisted data allows the node to recover if it restarts during block sync.
+func (t *stateSync) persistStateSyncFailure() error {
+	// Mark that we're switching to block sync due to state sync failure
+	if err := customrawdb.WriteSyncMode(t.db, "block"); err != nil {
+		return fmt.Errorf("failed to write sync mode: %w", err)
+	}
+
+	// Note: We don't persist a specific height here because state sync
+	// may have partially completed. The block sync will determine the
+	// actual starting point by checking the last accepted block.
+	log.Info("Persisted state sync failure, will resume with block sync")
 	return nil
 }

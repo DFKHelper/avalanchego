@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,9 +32,48 @@ import (
 
 const (
 	failedRequestSleepInterval = 10 * time.Millisecond
+	peerBlacklistDuration      = 2 * time.Minute  // How long to avoid a peer after consecutive failures
+	maxConsecutiveFailures     = 3                // Consecutive failures before blacklisting
+	perRequestTimeout          = 30 * time.Second // Timeout for individual request attempts
+	maxRetriesPerRequest       = 50               // Maximum retries before giving up on a request
+	retryWarningThreshold      = 20               // Log warning when retries exceed this
+
+	// Code request specific tuning
+	// Code requests have different timeout/retry characteristics because:
+	// 1. Code data can be larger than trie leafs
+	// 2. Peer unavailability is more common (not all peers have all contracts)
+	// 3. Failures should be detected faster since storage doesn't depend on code
+	codeRequestTimeout           = 45 * time.Second // Longer timeout for large code (vs 30s)
+	codeRequestMaxRetries        = 10               // 10 × 45s = 7.5 min (reduced from 30 to prevent DoS amplification)
+	codeRequestBlacklistDuration = 5 * time.Minute  // Longer blacklist for unresponsive code peers
 
 	epsilon = 1e-6 // small amount to add to time to avoid division by 0
 )
+
+var (
+	errTooManyRetries = errors.New("request failed after too many retries")
+)
+
+// exponentialBackoff calculates exponential backoff delay with a maximum cap.
+// Starts at baseDelay and doubles with each attempt, capped at 5 seconds.
+// This reduces time wasted on repeatedly failing peers.
+func exponentialBackoff(attempt int, baseDelay time.Duration) time.Duration {
+	// Cap exponent at 9 to prevent overflow (2^9 = 512)
+	exp := attempt
+	if exp > 9 {
+		exp = 9
+	}
+
+	delay := baseDelay * time.Duration(1<<exp) // 2^attempt
+
+	// Cap at 5 seconds to avoid excessive delays
+	maxDelay := 5 * time.Second
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+
+	return delay
+}
 
 var (
 	StateSyncVersion = &version.Application{
@@ -73,6 +113,163 @@ type Client interface {
 // Returns the number of elements in the response (specific to the response type, used in metrics)
 type parseResponseFn func(codec codec.Manager, request message.Request, response []byte) (interface{}, int, error)
 
+// peerFailureTracker tracks consecutive failures per peer for blacklisting
+type peerFailureTracker struct {
+	failures       map[ids.NodeID]int
+	blacklistUntil map[ids.NodeID]time.Time
+	lock           sync.RWMutex
+}
+
+func newPeerFailureTracker() *peerFailureTracker {
+	return &peerFailureTracker{
+		failures:       make(map[ids.NodeID]int),
+		blacklistUntil: make(map[ids.NodeID]time.Time),
+	}
+}
+
+func (p *peerFailureTracker) recordFailure(nodeID ids.NodeID) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	p.failures[nodeID]++
+	if p.failures[nodeID] >= maxConsecutiveFailures {
+		p.blacklistUntil[nodeID] = time.Now().Add(peerBlacklistDuration)
+		log.Debug("peer blacklisted temporarily", "nodeID", nodeID, "failures", p.failures[nodeID], "until", p.blacklistUntil[nodeID])
+	}
+}
+
+func (p *peerFailureTracker) recordSuccess(nodeID ids.NodeID) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	delete(p.failures, nodeID)
+	delete(p.blacklistUntil, nodeID)
+}
+
+func (p *peerFailureTracker) isBlacklisted(nodeID ids.NodeID) bool {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+
+	until, exists := p.blacklistUntil[nodeID]
+	if !exists {
+		return false
+	}
+	if time.Now().After(until) {
+		// Blacklist expired, clean up in a deferred goroutine to avoid holding lock
+		go func() {
+			p.lock.Lock()
+			defer p.lock.Unlock()
+			delete(p.blacklistUntil, nodeID)
+			delete(p.failures, nodeID)
+		}()
+		return false
+	}
+	return true
+}
+
+// peerMetrics tracks performance metrics for a peer
+// All fields are protected by peerMetricsTracker.lock
+type peerMetrics struct {
+	avgLatency     time.Duration // exponential moving average of request latency
+	successCount   int64         // number of successful requests
+	requestCount   int64         // total number of requests
+	lastUpdateTime time.Time     // last time metrics were updated
+}
+
+// successRate calculates the success rate as a float between 0 and 1.
+// Must be called with peerMetricsTracker.lock held (either RLock or Lock).
+func (m *peerMetrics) successRate() float64 {
+	if m.requestCount == 0 {
+		return 1.0 // no data yet, assume good
+	}
+	return float64(m.successCount) / float64(m.requestCount)
+}
+
+// peerMetricsTracker tracks performance metrics for all peers to enable intelligent peer selection
+type peerMetricsTracker struct {
+	metrics map[ids.NodeID]*peerMetrics
+	lock    sync.RWMutex
+}
+
+func newPeerMetricsTracker() *peerMetricsTracker {
+	return &peerMetricsTracker{
+		metrics: make(map[ids.NodeID]*peerMetrics),
+	}
+}
+
+// recordRequest records the latency and outcome of a request
+func (p *peerMetricsTracker) recordRequest(nodeID ids.NodeID, latency time.Duration, success bool) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	m, exists := p.metrics[nodeID]
+	if !exists {
+		m = &peerMetrics{
+			avgLatency:     latency,
+			successCount:   0,
+			requestCount:   0,
+			lastUpdateTime: time.Now(),
+		}
+		p.metrics[nodeID] = m
+	}
+
+	// Update exponential moving average: new_avg = 0.7 * old_avg + 0.3 * new_value
+	// This gives more weight to recent measurements while smoothing out spikes
+	const alpha = 0.3
+	m.avgLatency = time.Duration(float64(m.avgLatency)*(1-alpha) + float64(latency)*alpha)
+
+	m.requestCount++
+	if success {
+		m.successCount++
+	}
+	m.lastUpdateTime = time.Now()
+}
+
+// selectBestPeer selects the peer with the best combination of low latency and high success rate
+// from the provided list of candidate peers. Returns the zero NodeID if no suitable peer found.
+func (p *peerMetricsTracker) selectBestPeer(candidates []ids.NodeID) ids.NodeID {
+	if len(candidates) == 0 {
+		return ids.NodeID{}
+	}
+
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+
+	var bestPeer ids.NodeID
+	var bestScore float64 = -1
+
+	for _, nodeID := range candidates {
+		m, exists := p.metrics[nodeID]
+		if !exists {
+			// No metrics for this peer yet - consider it as a candidate with neutral score
+			// This ensures new peers get tried
+			score := 0.5
+			if score > bestScore {
+				bestScore = score
+				bestPeer = nodeID
+			}
+			continue
+		}
+
+		// Calculate score: higher is better
+		// Score combines success rate (0-1) and inverse latency
+		// Normalize latency using inverse function: lower latency = higher score
+		successRate := m.successRate()
+		latencyMs := float64(m.avgLatency.Milliseconds())
+		latencyScore := 100.0 / (100.0 + latencyMs) // 100ms -> 0.5, 1000ms -> 0.09, 10ms -> 0.91
+
+		// Weight: 70% success rate, 30% latency
+		score := 0.7*successRate + 0.3*latencyScore
+
+		if score > bestScore {
+			bestScore = score
+			bestPeer = nodeID
+		}
+	}
+
+	return bestPeer
+}
+
 type client struct {
 	networkClient    network.SyncedNetworkClient
 	codec            codec.Manager
@@ -80,6 +277,8 @@ type client struct {
 	stateSyncNodeIdx uint32
 	stats            stats.ClientSyncerStats
 	blockParser      EthBlockParser
+	peerTracker      *peerFailureTracker
+	metricsTracker   *peerMetricsTracker // tracks latency and success rate for intelligent peer selection
 }
 
 type ClientConfig struct {
@@ -101,6 +300,8 @@ func NewClient(config *ClientConfig) *client {
 		stats:          config.Stats,
 		stateSyncNodes: config.StateSyncNodeIDs,
 		blockParser:    config.BlockParser,
+		peerTracker:    newPeerFailureTracker(),
+		metricsTracker: newPeerMetricsTracker(),
 	}
 }
 
@@ -295,13 +496,47 @@ func (c *client) get(ctx context.Context, request message.Request, parseFn parse
 	if err != nil {
 		return nil, err
 	}
+
+	// Detect code requests for special handling
+	var isCodeRequest bool
+	if _, ok := request.(message.CodeRequest); ok {
+		isCodeRequest = true
+	}
+
 	var (
 		responseIntf interface{}
 		numElements  int
 		lastErr      error
 	)
-	// Loop until the context is cancelled or we get a valid response.
+
+	// Adaptive retry limit based on request type
+	// Code requests use fewer retries to fail faster (storage doesn't depend on code)
+	retryLimit := maxRetriesPerRequest
+	warningThreshold := retryWarningThreshold
+	if isCodeRequest {
+		retryLimit = codeRequestMaxRetries
+		warningThreshold = codeRequestMaxRetries * 2 / 3 // Warn at 2/3 of limit (20/30)
+	}
+
+	// Loop until the context is cancelled, we get a valid response, or hit retry limit
 	for attempt := 0; ; attempt++ {
+
+		// Check retry limit to prevent infinite loops
+		if attempt >= retryLimit {
+			return nil, fmt.Errorf("%w: %d attempts (limit: %d), last error: %v",
+				errTooManyRetries, attempt, retryLimit, lastErr)
+		}
+
+		// Log warning when approaching retry limit
+		if attempt == warningThreshold {
+			log.Warn("Request retry count high, may be stuck",
+				"attempt", attempt,
+				"maxRetries", retryLimit,
+				"requestType", fmt.Sprintf("%T", request),
+				"isCodeRequest", isCodeRequest,
+				"lastErr", lastErr)
+		}
+
 		// If the context has finished, return the context error early.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			if lastErr != nil {
@@ -318,28 +553,106 @@ func (c *client) get(ctx context.Context, request message.Request, parseFn parse
 			nodeID   ids.NodeID
 			start    = time.Now()
 		)
-		if len(c.stateSyncNodes) == 0 {
-			response, nodeID, err = c.networkClient.SendSyncedAppRequestAny(ctx, StateSyncVersion, requestBytes)
-		} else {
-			// get the next nodeID using the nodeIdx offset. If we're out of nodes, loop back to 0
-			// we do this every attempt to ensure we get a different node each time if possible.
-			nodeIdx := atomic.AddUint32(&c.stateSyncNodeIdx, 1)
-			nodeID = c.stateSyncNodes[nodeIdx%uint32(len(c.stateSyncNodes))]
 
-			response, err = c.networkClient.SendSyncedAppRequest(ctx, nodeID, requestBytes)
-		}
+		// Create a per-request timeout context to prevent hanging on slow peers
+		// Use adaptive timeout based on request type
+		// Use an anonymous function to ensure cancel() is called after each request
+		func() {
+			timeout := perRequestTimeout
+			if isCodeRequest {
+				timeout = codeRequestTimeout // 45s for code (larger data)
+			}
+			requestCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+
+			if len(c.stateSyncNodes) == 0 {
+				response, nodeID, err = c.networkClient.SendSyncedAppRequestAny(requestCtx, StateSyncVersion, requestBytes)
+			} else {
+				// Intelligent peer selection: prefer peers with low latency and high success rate
+				// Build list of non-blacklisted peers
+				candidates := make([]ids.NodeID, 0, len(c.stateSyncNodes))
+				for _, peer := range c.stateSyncNodes {
+					if !c.peerTracker.isBlacklisted(peer) {
+						candidates = append(candidates, peer)
+					}
+				}
+
+				// If all peers are blacklisted, use all peers (stale blacklist recovery)
+				if len(candidates) == 0 {
+					log.Debug("all static peers blacklisted, using all peers anyway", "numPeers", len(c.stateSyncNodes))
+					candidates = c.stateSyncNodes
+				}
+
+				// For code requests, use aggressive round-robin rotation to quickly try different peers
+				// since we've observed peers accepting requests but not responding (timeout)
+				if isCodeRequest {
+					// Force round-robin rotation for code requests to avoid stuck peers
+					nodeIdx := atomic.AddUint32(&c.stateSyncNodeIdx, 1)
+					nodeID = candidates[nodeIdx%uint32(len(candidates))]
+					if attempt == 0 {
+						log.Debug("Code request - using round-robin peer selection",
+							"peer", nodeID,
+							"numCandidates", len(candidates))
+					}
+				} else {
+					// For other requests, use best peer based on latency and success rate metrics
+					nodeID = c.metricsTracker.selectBestPeer(candidates)
+					if nodeID == (ids.NodeID{}) {
+						// No peer selected (shouldn't happen), fall back to round-robin from candidates
+						nodeIdx := atomic.AddUint32(&c.stateSyncNodeIdx, 1)
+						nodeID = candidates[nodeIdx%uint32(len(candidates))]
+					}
+				}
+
+				response, err = c.networkClient.SendSyncedAppRequest(requestCtx, nodeID, requestBytes)
+			}
+		}()
+
 		metric.UpdateRequestLatency(time.Since(start))
 
 		if err != nil {
 			ctx := make([]interface{}, 0, 8)
 			if nodeID != ids.EmptyNodeID {
 				ctx = append(ctx, "nodeID", nodeID)
+				c.peerTracker.recordFailure(nodeID)
+				c.metricsTracker.recordRequest(nodeID, time.Since(start), false) // Record failed request
 			}
 			ctx = append(ctx, "attempt", attempt, "request", request, "err", err)
-			log.Debug("request failed, retrying", ctx...)
+
+			// Enhanced logging for code requests to diagnose peer issues
+			if isCodeRequest {
+				// Detect timeout vs other errors for better diagnostics
+				isTimeout := errors.Is(err, context.DeadlineExceeded) ||
+					(err != nil && (err.Error() == "" ||
+						bytes.Contains([]byte(err.Error()), []byte("timeout")) ||
+						bytes.Contains([]byte(err.Error()), []byte("deadline"))))
+
+				latency := time.Since(start)
+
+				if isTimeout {
+					log.Warn("Code request timeout - peer accepted but didn't respond",
+						"nodeID", nodeID,
+						"attempt", attempt,
+						"retryLimit", retryLimit,
+						"latency", latency.Round(time.Millisecond),
+						"willRetryWithDifferentPeer", attempt < retryLimit-1)
+				} else {
+					// Other errors (network failure, validation error, etc.)
+					log.Warn("Code request failed",
+						"nodeID", nodeID,
+						"attempt", attempt,
+						"err", err,
+						"errType", fmt.Sprintf("%T", err))
+				}
+			} else {
+				log.Debug("request failed, retrying", ctx...)
+			}
+
 			metric.IncFailed()
 			c.networkClient.TrackBandwidth(nodeID, 0)
-			time.Sleep(failedRequestSleepInterval)
+			// Use exponential backoff to avoid wasting time on repeatedly failing peers
+			backoff := exponentialBackoff(attempt, failedRequestSleepInterval)
+			time.Sleep(backoff)
 			continue
 		} else {
 			responseIntf, numElements, err = parseFn(c.codec, request, response)
@@ -347,6 +660,8 @@ func (c *client) get(ctx context.Context, request message.Request, parseFn parse
 				lastErr = err
 				log.Debug("could not validate response, retrying", "nodeID", nodeID, "attempt", attempt, "request", request, "err", err)
 				c.networkClient.TrackBandwidth(nodeID, 0)
+				c.peerTracker.recordFailure(nodeID)
+				c.metricsTracker.recordRequest(nodeID, time.Since(start), false) // Record failed validation
 				metric.IncFailed()
 				metric.IncInvalidResponse()
 				continue
@@ -354,6 +669,8 @@ func (c *client) get(ctx context.Context, request message.Request, parseFn parse
 
 			bandwidth := float64(len(response)) / (time.Since(start).Seconds() + epsilon)
 			c.networkClient.TrackBandwidth(nodeID, bandwidth)
+			c.peerTracker.recordSuccess(nodeID)
+			c.metricsTracker.recordRequest(nodeID, time.Since(start), true) // Record successful request
 			metric.IncSucceeded()
 			metric.IncReceived(int64(numElements))
 			return responseIntf, nil
