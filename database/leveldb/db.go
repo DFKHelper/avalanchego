@@ -33,15 +33,18 @@ const (
 
 	// DefaultBlockCacheSize is the number of bytes to use for block caching in
 	// leveldb.
-	DefaultBlockCacheSize = 12 * opt.MiB
+	// Optimized for modern systems with 16GB+ RAM: 12 MiB to 8 GiB
+	DefaultBlockCacheSize = 8 * opt.GiB
 
 	// DefaultWriteBufferSize is the number of bytes to use for buffers in
 	// leveldb.
-	DefaultWriteBufferSize = 12 * opt.MiB
+	// Optimized for write-heavy bootstrap workloads: 12 MiB to 512 MiB
+	DefaultWriteBufferSize = 512 * opt.MiB
 
 	// DefaultHandleCap is the number of files descriptors to cap levelDB to
 	// use.
-	DefaultHandleCap = 1024
+	// Increased for better concurrent access: 1024 to 16384
+	DefaultHandleCap = 16384
 
 	// DefaultBitsPerKey is the number of bits to add to the bloom filter per
 	// key.
