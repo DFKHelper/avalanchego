@@ -240,7 +240,7 @@ func (b *Bootstrapper) HasProgress(ctx context.Context) (bool, error) {
 	// No checkpoint but blocks exist - corrupted state
 	if checkpoint == nil {
 		b.Ctx.Log.Warn("bootstrap blocks exist but no checkpoint found, state corrupted",
-			zap.Int("numBlocks", tree.Len()))
+			zap.Int("numBlocks", int(tree.Len())))
 		// Clear corrupted state (using database.AtomicClear directly - safe without lock)
 		if clearErr := database.AtomicClear(b.DB, b.DB); clearErr != nil {
 			b.Ctx.Log.Warn("failed to clear corrupted bootstrap state",
@@ -308,7 +308,7 @@ func (b *Bootstrapper) HasProgress(ctx context.Context) (bool, error) {
 	// 4. Validate block count is reasonable
 	if checkpoint.NumBlocksFetched == 0 {
 		b.Ctx.Log.Warn("checkpoint has zero blocks fetched but tree has blocks, corrupted",
-			zap.Int("treeLen", tree.Len()))
+			zap.Int("treeLen", int(tree.Len())))
 		// Clear corrupted state (using database.AtomicClear directly - safe without lock)
 		if clearErr := database.AtomicClear(b.DB, b.DB); clearErr != nil {
 			b.Ctx.Log.Warn("failed to clear corrupted bootstrap state",
@@ -319,7 +319,7 @@ func (b *Bootstrapper) HasProgress(ctx context.Context) (bool, error) {
 
 	// 5. Validate tree length matches checkpoint metadata (within reason)
 	expectedBlocks := int(checkpoint.NumBlocksFetched)
-	actualBlocks := tree.Len()
+	actualBlocks := int(tree.Len())
 	// Allow some tolerance (10% or minimum 5 blocks, whichever is larger)
 	// This handles both large and small checkpoint sizes appropriately
 	tolerance := expectedBlocks / 10
@@ -851,8 +851,8 @@ func (b *Bootstrapper) process(
 	}
 
 	// Update metrics and log statuses
+	numFetched := b.tree.Len()
 	{
-		numFetched := b.tree.Len()
 		b.numFetched.Add(float64(b.tree.Len() - numPreviouslyFetched))
 
 		height := blk.Height()
