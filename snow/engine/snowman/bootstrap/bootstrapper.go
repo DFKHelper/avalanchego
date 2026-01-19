@@ -154,7 +154,7 @@ func New(config Config, onFinished func(ctx context.Context, lastReqID uint32) e
 	// Set checkpoint interval from config or use default
 	checkpointInterval := config.CheckpointInterval
 	if checkpointInterval == 0 {
-		checkpointInterval = 100000 // Default: 100,000 blocks
+		checkpointInterval = 50000 // Default: 50,000 blocks (optimized for recovery)
 	}
 
 	bs := &Bootstrapper{
