@@ -459,13 +459,30 @@ func (h *handler) tryRecoverFromStateCorruption(ctx context.Context, err error) 
 	h.lastStateCorruption.Store(now)
 
 	// Log recovery attempt
-	h.ctx.Log.Info("initiating state corruption recovery: will halt bootstrapping to trigger checkpoint rollback")
+	h.ctx.Log.Info("initiating state corruption recovery: will rollback to safe checkpoint and delete VM state")
 
-	// Halt bootstrapping - this will cause the node to restart bootstrap process
-	// The bootstrapper will detect the corrupt state and roll back to last checkpoint
+	// Attempt to recover through the engine manager
+	// This calls RecoverFromStateCorruption on the bootstrapper which will:
+	// 1. Calculate safe rollback height (2 checkpoints back)
+	// 2. Delete VM state database
+	// 3. Create checkpoint at rollback height
+	// 4. Halt bootstrapping to trigger restart
+	if bootstrapper, ok := h.engineManager.Get().(interface {
+		RecoverFromStateCorruption(context.Context, error) bool
+	}); ok {
+		if bootstrapper.RecoverFromStateCorruption(ctx, err) {
+			h.ctx.Log.Info("state corruption recovery initiated successfully")
+			// Halt bootstrapping to trigger node restart with clean state
+			h.haltBootstrapping()
+			return true
+		}
+		h.ctx.Log.Error("state corruption recovery failed")
+		return false
+	}
+
+	// If we can't get the bootstrapper interface, fall back to just halting
+	h.ctx.Log.Warn("cannot access bootstrapper for recovery, falling back to simple halt")
 	h.haltBootstrapping()
-
-	// Return true to indicate we handled the error (don't fatal crash)
 	return true
 }
 

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -1333,12 +1335,18 @@ func (b *Bootstrapper) HealthCheck(ctx context.Context) (interface{}, error) {
 }
 
 // RecoverFromStateCorruption attempts to recover from state database corruption
-// by rolling back to the last valid checkpoint. This preserves most bootstrap
-// progress instead of starting from genesis.
+// by rolling back to a safe checkpoint, deleting the VM state database, and
+// forcing state rebuild from the rollback point. This preserves significant
+// bootstrap progress while ensuring clean state.
+//
+// Strategy: Roll back 2 checkpoint intervals before last checkpoint for safety,
+// delete VM state, and let it rebuild through block re-execution.
 //
 // Returns true if recovery was initiated, false if recovery is not possible.
-func (b *Bootstrapper) RecoverFromStateCorruption(ctx context.Context) bool {
-	b.Ctx.Log.Warn("attempting to recover from state corruption")
+func (b *Bootstrapper) RecoverFromStateCorruption(ctx context.Context, corruptionErr error) bool {
+	b.Ctx.Log.Warn("attempting to recover from state corruption",
+		zap.Error(corruptionErr),
+	)
 
 	// Read last checkpoint
 	checkpoint, err := interval.GetFetchCheckpoint(b.DB)
@@ -1352,6 +1360,12 @@ func (b *Bootstrapper) RecoverFromStateCorruption(ctx context.Context) bool {
 				zap.Error(clearErr),
 			)
 		}
+		// Also try to stop the VM to trigger clean restart
+		if shutdownErr := b.VM.Shutdown(ctx); shutdownErr != nil {
+			b.Ctx.Log.Warn("failed to shutdown VM during recovery",
+				zap.Error(shutdownErr),
+			)
+		}
 		return false
 	}
 
@@ -1361,22 +1375,84 @@ func (b *Bootstrapper) RecoverFromStateCorruption(ctx context.Context) bool {
 		return false
 	}
 
-	b.Ctx.Log.Info("rolling back to last checkpoint to recover from state corruption",
-		zap.Uint64("checkpointHeight", checkpoint.Height),
-		zap.Uint64("blocksFetched", checkpoint.NumBlocksFetched),
-		zap.Time("checkpointTime", checkpoint.Timestamp),
+	// Calculate safe rollback height: 2 checkpoint intervals before last checkpoint
+	// This ensures we're well clear of corruption
+	safeRollbackHeight := checkpoint.Height
+	if checkpoint.Height >= 2*b.checkpointInterval {
+		safeRollbackHeight = checkpoint.Height - 2*b.checkpointInterval
+	} else if checkpoint.Height >= b.checkpointInterval {
+		safeRollbackHeight = checkpoint.Height - b.checkpointInterval
+	}
+	// Else keep at checkpoint.Height if we're very early in bootstrap
+
+	b.Ctx.Log.Info("rolling back to safe checkpoint to recover from state corruption",
+		zap.Uint64("corruptCheckpointHeight", checkpoint.Height),
+		zap.Uint64("safeRollbackHeight", safeRollbackHeight),
+		zap.Uint64("blocksToReprocess", checkpoint.Height-safeRollbackHeight),
+		zap.Uint64("checkpointInterval", b.checkpointInterval),
 	)
 
-	// Trigger restart of bootstrapping
-	// The bootstrapper will automatically resume from the checkpoint on next start
-	// by detecting it in Start() and using it to resume progress
+	// Create a new checkpoint at the safe rollback height
+	// This tells bootstrap where to resume from
+	safeCheckpoint := &interval.FetchCheckpoint{
+		Height:              safeRollbackHeight,
+		TipHeight:           checkpoint.TipHeight, // Keep same tip
+		StartingHeight:      checkpoint.StartingHeight,
+		NumBlocksFetched:    0, // Will be recalculated during resume
+		Timestamp:           time.Now(),
+		MissingBlockIDCount: 0,
+		ETASamples:          nil, // Reset ETA
+	}
+
+	if err := interval.PutFetchCheckpoint(b.DB, safeCheckpoint); err != nil {
+		b.Ctx.Log.Error("failed to save safe rollback checkpoint",
+			zap.Error(err),
+		)
+		return false
+	}
+
+	b.Ctx.Log.Info("saved safe rollback checkpoint, will delete VM state database",
+		zap.Uint64("rollbackHeight", safeRollbackHeight),
+	)
+
+	// Shutdown VM to release database locks
+	if err := b.VM.Shutdown(ctx); err != nil {
+		b.Ctx.Log.Warn("failed to shutdown VM cleanly before state deletion",
+			zap.Error(err),
+		)
+		// Continue anyway - we'll try to delete what we can
+	}
+
+	// Delete the chain's database directory to force complete state rebuild
+	// For per-chain databases, this is the chain-specific directory
+	// The VM will rebuild state from scratch when blocks are re-executed
+	chainDBPath := filepath.Join(b.Ctx.ChainDataDir, "state")
+	if err := os.RemoveAll(chainDBPath); err != nil {
+		b.Ctx.Log.Error("failed to delete VM state database for rollback",
+			zap.String("path", chainDBPath),
+			zap.Error(err),
+		)
+		// This is critical - can't recover without deleting state
+		return false
+	}
+
+	b.Ctx.Log.Info("deleted VM state database, forcing state rebuild from rollback height",
+		zap.String("deletedPath", chainDBPath),
+		zap.Uint64("rollbackHeight", safeRollbackHeight),
+	)
 
 	// Clear any corrupt in-memory state
 	b.missingBlockIDs.Clear()
 	b.outstandingRequests.Clear()
 	b.tree = interval.NewTree()
 
-	b.Ctx.Log.Info("state corruption recovery initiated - bootstrap will resume from checkpoint")
+	b.Ctx.Log.Info("state corruption recovery complete - node will restart and rebuild state",
+		zap.Uint64("rollbackHeight", safeRollbackHeight),
+		zap.Uint64("blocksToReprocess", checkpoint.Height-safeRollbackHeight),
+	)
+
+	// Return true to indicate successful recovery setup
+	// The handler will halt bootstrapping, node will restart, and resume from safe checkpoint
 	return true
 }
 
