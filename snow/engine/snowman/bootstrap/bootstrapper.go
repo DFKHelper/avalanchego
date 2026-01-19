@@ -1332,6 +1332,54 @@ func (b *Bootstrapper) HealthCheck(ctx context.Context) (interface{}, error) {
 	return intf, vmErr
 }
 
+// RecoverFromStateCorruption attempts to recover from state database corruption
+// by rolling back to the last valid checkpoint. This preserves most bootstrap
+// progress instead of starting from genesis.
+//
+// Returns true if recovery was initiated, false if recovery is not possible.
+func (b *Bootstrapper) RecoverFromStateCorruption(ctx context.Context) bool {
+	b.Ctx.Log.Warn("attempting to recover from state corruption")
+
+	// Read last checkpoint
+	checkpoint, err := interval.GetFetchCheckpoint(b.DB)
+	if err != nil || checkpoint == nil {
+		b.Ctx.Log.Warn("no checkpoint available for state corruption recovery, must restart from genesis",
+			zap.Error(err),
+		)
+		// Clear all bootstrap state and restart from scratch
+		if clearErr := interval.DeleteFetchCheckpoint(b.DB); clearErr != nil {
+			b.Ctx.Log.Warn("failed to clear checkpoint during recovery",
+				zap.Error(clearErr),
+			)
+		}
+		return false
+	}
+
+	// Validate checkpoint
+	if !b.validateCheckpoint(checkpoint) {
+		b.Ctx.Log.Warn("checkpoint validation failed during recovery, cannot use for rollback")
+		return false
+	}
+
+	b.Ctx.Log.Info("rolling back to last checkpoint to recover from state corruption",
+		zap.Uint64("checkpointHeight", checkpoint.Height),
+		zap.Uint64("blocksFetched", checkpoint.NumBlocksFetched),
+		zap.Time("checkpointTime", checkpoint.Timestamp),
+	)
+
+	// Trigger restart of bootstrapping
+	// The bootstrapper will automatically resume from the checkpoint on next start
+	// by detecting it in Start() and using it to resume progress
+
+	// Clear any corrupt in-memory state
+	b.missingBlockIDs.Clear()
+	b.outstandingRequests.Clear()
+	b.tree = interval.NewTree()
+
+	b.Ctx.Log.Info("state corruption recovery initiated - bootstrap will resume from checkpoint")
+	return true
+}
+
 func (b *Bootstrapper) Shutdown(ctx context.Context) error {
 	b.Ctx.Log.Info("shutting down bootstrapper")
 

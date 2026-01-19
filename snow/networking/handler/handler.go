@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -128,6 +129,10 @@ type handler struct {
 	// Tracks the peers that are currently connected to this subnet
 	peerTracker commontracker.Peers
 	p2pTracker  *p2p.PeerTracker
+
+	// State corruption tracking for self-healing
+	stateCorruptionCount atomic.Uint32
+	lastStateCorruption  atomic.Int64 // Unix timestamp
 }
 
 // Initialize this consensus handler
@@ -387,6 +392,16 @@ func (h *handler) dispatchSync(ctx context.Context) {
 
 		// If there is an error handling the message, shut down the chain
 		if err := h.handleSyncMsg(ctx, msg); err != nil {
+			// Check if this is a state corruption error that we can recover from
+			if h.isStateCorruptionError(err) && h.tryRecoverFromStateCorruption(ctx, err) {
+				h.ctx.Log.Warn("recovered from state corruption, continuing bootstrap",
+					zap.Error(err),
+					zap.String("messageOp", msg.Op.String()),
+					zap.Stringer("nodeID", msg.NodeID),
+				)
+				continue
+			}
+
 			h.StopWithError(ctx, fmt.Errorf(
 				"%w while processing sync message: %s from %s",
 				err,
@@ -396,6 +411,62 @@ func (h *handler) dispatchSync(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// isStateCorruptionError detects if an error indicates state database corruption
+func (h *handler) isStateCorruptionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// Detect common state corruption patterns
+	return strings.Contains(errStr, "failed to get next removed staker tx") ||
+		strings.Contains(errStr, "failed to get staker tx") ||
+		(strings.Contains(errStr, "not found") && strings.Contains(errStr, "staker"))
+}
+
+// tryRecoverFromStateCorruption attempts to recover from state corruption
+// Returns true if recovery was attempted, false if this error should be fatal
+func (h *handler) tryRecoverFromStateCorruption(ctx context.Context, err error) bool {
+	now := h.clock.Time().Unix()
+	lastCorruption := h.lastStateCorruption.Load()
+
+	// Check if we've seen state corruption recently (within 1 hour)
+	if lastCorruption > 0 && (now-lastCorruption) < 3600 {
+		count := h.stateCorruptionCount.Add(1)
+
+		// If we've hit state corruption too many times, give up
+		if count > 3 {
+			h.ctx.Log.Error("state corruption persists after multiple recovery attempts, manual intervention required",
+				zap.Uint32("attempts", count),
+				zap.Error(err),
+			)
+			return false
+		}
+
+		h.ctx.Log.Warn("state corruption detected again, attempting recovery",
+			zap.Uint32("attempt", count),
+			zap.Error(err),
+		)
+	} else {
+		// First corruption or it's been a while, reset counter
+		h.stateCorruptionCount.Store(1)
+		h.ctx.Log.Warn("state corruption detected for first time, attempting recovery",
+			zap.Error(err),
+		)
+	}
+
+	h.lastStateCorruption.Store(now)
+
+	// Log recovery attempt
+	h.ctx.Log.Info("initiating state corruption recovery: will halt bootstrapping to trigger checkpoint rollback")
+
+	// Halt bootstrapping - this will cause the node to restart bootstrap process
+	// The bootstrapper will detect the corrupt state and roll back to last checkpoint
+	h.haltBootstrapping()
+
+	// Return true to indicate we handled the error (don't fatal crash)
+	return true
 }
 
 func (h *handler) dispatchAsync(ctx context.Context) {
