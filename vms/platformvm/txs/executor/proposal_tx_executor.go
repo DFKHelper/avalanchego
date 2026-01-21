@@ -17,6 +17,7 @@ import (
 	"github.com/ava-labs/avalanchego/vms/platformvm/state"
 	"github.com/ava-labs/avalanchego/vms/platformvm/txs"
 	"github.com/ava-labs/avalanchego/vms/platformvm/txs/fee"
+	"go.uber.org/zap"
 )
 
 const (
@@ -371,6 +372,25 @@ func (e *proposalTxExecutor) RewardValidatorTx(tx *txs.RewardValidatorTx) error 
 
 	stakerTx, _, err := e.onCommitState.GetTx(stakerToReward.TxID)
 	if err != nil {
+		// During bootstrap, if we can't find the transaction, just remove the validator
+		// without processing rewards. This allows bootstrap to continue past missing
+		// transactions that may have been aborted or lost due to chain inconsistencies.
+		if !e.backend.Bootstrapped.Get() {
+			e.backend.Ctx.Log.Warn("transaction not found during bootstrap, removing validator without rewards",
+				zap.String("txID", stakerToReward.TxID.String()),
+				zap.String("nodeID", stakerToReward.NodeID.String()),
+				zap.String("subnetID", stakerToReward.SubnetID.String()),
+				zap.Time("endTime", stakerToReward.EndTime),
+				zap.Error(err),
+			)
+			// Just remove the validator from the set and continue
+			// No rewards, no stake refund - but bootstrap can progress
+			e.onCommitState.DeleteCurrentValidator(stakerToReward)
+			e.onAbortState.DeleteCurrentValidator(stakerToReward)
+			return nil
+		}
+
+		// During normal operation, this is a real error
 		return fmt.Errorf("failed to get next removed staker tx %s (nodeID=%s, subnetID=%s, endTime=%s): %w",
 			stakerToReward.TxID,
 			stakerToReward.NodeID,
