@@ -1392,12 +1392,15 @@ func (b *Bootstrapper) RecoverFromStateCorruption(ctx context.Context, corruptio
 		zap.Uint64("checkpointInterval", b.checkpointInterval),
 	)
 
-	// Create a new checkpoint at the safe rollback height
-	// This tells bootstrap where to resume from
+	// Create a new checkpoint to restart from genesis
+	// After deleting the state database, we MUST restart from height 0 to rebuild
+	// all transaction indices. Resuming from a partial checkpoint would leave the
+	// validator set loaded but historical AddValidatorTx transactions unindexed,
+	// causing "transaction not found" errors when processing RewardValidatorTx.
 	safeCheckpoint := &interval.FetchCheckpoint{
-		Height:              safeRollbackHeight,
+		Height:              0, // CRITICAL: Restart from genesis after state deletion
 		TipHeight:           checkpoint.TipHeight, // Keep same tip
-		StartingHeight:      checkpoint.StartingHeight,
+		StartingHeight:      0, // Also reset starting height
 		NumBlocksFetched:    0, // Will be recalculated during resume
 		Timestamp:           time.Now(),
 		MissingBlockIDCount: 0,

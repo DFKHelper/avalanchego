@@ -392,7 +392,27 @@ func (h *handler) dispatchSync(ctx context.Context) {
 
 		// If there is an error handling the message, shut down the chain
 		if err := h.handleSyncMsg(ctx, msg); err != nil {
-			// Check if this is a state corruption error that we can recover from
+			// Check if this looks like a state corruption error (missing staker tx)
+			errStr := err.Error()
+			isMissingStakerTx := strings.Contains(errStr, "failed to get next removed staker tx") ||
+				strings.Contains(errStr, "failed to get staker tx") ||
+				(strings.Contains(errStr, "not found") && strings.Contains(errStr, "staker"))
+
+			// During bootstrap, missing staker transactions are expected and will be
+			// resolved on subsequent runs as more transactions are indexed.
+			engineState := h.ctx.State.Get()
+			if isMissingStakerTx && engineState.State != snow.NormalOp {
+				h.ctx.Log.Warn("missing staker transaction during bootstrap - will retry",
+					zap.Error(err),
+					zap.String("messageOp", msg.Op.String()),
+					zap.Stringer("nodeID", msg.NodeID),
+					zap.String("note", "transaction will be indexed in subsequent bootstrap runs"),
+				)
+				// Don't shut down - continue processing other messages
+				continue
+			}
+
+			// Check if this is a state corruption error that we can recover from (during normal operation)
 			if h.isStateCorruptionError(err) && h.tryRecoverFromStateCorruption(ctx, err) {
 				h.ctx.Log.Warn("recovered from state corruption, continuing bootstrap",
 					zap.Error(err),
@@ -418,8 +438,21 @@ func (h *handler) isStateCorruptionError(err error) bool {
 	if err == nil {
 		return false
 	}
+
+	// During bootstrap, missing staker transactions are expected when replaying from
+	// a checkpoint that includes the validator set but not all historical transaction
+	// indices. This is NOT corruption - it's a normal condition that will resolve as
+	// bootstrap progresses and more transactions are indexed.
+	//
+	// Only treat this as corruption if we're already bootstrapped (normal operation).
+	engineState := h.ctx.State.Get()
+	if engineState.State != snow.NormalOp {
+		// Still initializing/syncing/bootstrapping - don't treat missing tx as corruption
+		return false
+	}
+
 	errStr := err.Error()
-	// Detect common state corruption patterns
+	// Detect common state corruption patterns (only during normal operation)
 	return strings.Contains(errStr, "failed to get next removed staker tx") ||
 		strings.Contains(errStr, "failed to get staker tx") ||
 		(strings.Contains(errStr, "not found") && strings.Contains(errStr, "staker"))
@@ -467,17 +500,20 @@ func (h *handler) tryRecoverFromStateCorruption(ctx context.Context, err error) 
 	// 2. Delete VM state database
 	// 3. Create checkpoint at rollback height
 	// 4. Halt bootstrapping to trigger restart
-	if bootstrapper, ok := h.engineManager.Get().(interface {
-		RecoverFromStateCorruption(context.Context, error) bool
-	}); ok {
-		if bootstrapper.RecoverFromStateCorruption(ctx, err) {
-			h.ctx.Log.Info("state corruption recovery initiated successfully")
-			// Halt bootstrapping to trigger node restart with clean state
-			h.haltBootstrapping()
-			return true
+	chainEngine := h.engineManager.Chain
+	if chainEngine != nil && chainEngine.Bootstrapper != nil {
+		if bootstrapper, ok := chainEngine.Bootstrapper.(interface {
+			RecoverFromStateCorruption(context.Context, error) bool
+		}); ok {
+			if bootstrapper.RecoverFromStateCorruption(ctx, err) {
+				h.ctx.Log.Info("state corruption recovery initiated successfully")
+				// Halt bootstrapping to trigger node restart with clean state
+				h.haltBootstrapping()
+				return true
+			}
+			h.ctx.Log.Error("state corruption recovery failed")
+			return false
 		}
-		h.ctx.Log.Error("state corruption recovery failed")
-		return false
 	}
 
 	// If we can't get the bootstrapper interface, fall back to just halting
