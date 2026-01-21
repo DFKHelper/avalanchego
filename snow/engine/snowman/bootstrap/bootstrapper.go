@@ -1423,36 +1423,98 @@ func (b *Bootstrapper) RecoverFromStateCorruption(ctx context.Context, corruptio
 		// Continue anyway - we'll try to delete what we can
 	}
 
+	// Wait for VM shutdown to complete and all database handles to close
+	// This is critical to avoid race conditions where database files are deleted
+	// while still being accessed by goroutines, which causes FATAL errors
+	b.Ctx.Log.Info("waiting for VM shutdown to complete before deleting database")
+	shutdownWaitTime := 5 * time.Second
+	time.Sleep(shutdownWaitTime)
+	b.Ctx.Log.Info("VM shutdown wait complete, proceeding with database deletion",
+		zap.Duration("waitTime", shutdownWaitTime),
+	)
+
 	// Delete the chain's database directory to force complete state rebuild
 	// For per-chain databases, this is the chain-specific directory
 	// The VM will rebuild state from scratch when blocks are re-executed
-	chainDBPath := filepath.Join(b.Ctx.ChainDataDir, "state")
-	if err := os.RemoveAll(chainDBPath); err != nil {
-		b.Ctx.Log.Error("failed to delete VM state database for rollback",
+	//
+	// The actual database path is: ~/.avalanchego/db/{network}/{version}/{chainID}
+	// We derive this from ChainDataDir which is: ~/.avalanchego/chainData/{chainID}
+	chainDataBase := filepath.Dir(b.Ctx.ChainDataDir)  // Get parent of chainData/CHAINID
+	avalanchegoDir := filepath.Dir(chainDataBase)       // Get ~/.avalanchego
+
+	// Construct the VM state database path
+	// TODO: Get network name and DB version from config instead of hardcoding
+	chainDBPath := filepath.Join(avalanchegoDir, "db", "mainnet", "v1.4.5", b.Ctx.ChainID.String())
+
+	b.Ctx.Log.Info("attempting to delete VM state database for recovery",
+		zap.String("path", chainDBPath),
+	)
+
+	// Retry database deletion with exponential backoff to handle lingering file locks
+	maxRetries := 3
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			retryWait := time.Duration(attempt) * 2 * time.Second
+			b.Ctx.Log.Info("retrying database deletion after wait",
+				zap.Int("attempt", attempt+1),
+				zap.Int("maxRetries", maxRetries),
+				zap.Duration("waitTime", retryWait),
+			)
+			time.Sleep(retryWait)
+		}
+
+		if err := os.RemoveAll(chainDBPath); err != nil && !os.IsNotExist(err) {
+			lastErr = err
+			b.Ctx.Log.Warn("failed to delete VM state database",
+				zap.String("path", chainDBPath),
+				zap.Error(err),
+				zap.Int("attempt", attempt+1),
+				zap.Int("maxRetries", maxRetries),
+			)
+			continue
+		}
+
+		// Success!
+		b.Ctx.Log.Info("deleted VM state database, forcing state rebuild from rollback height",
+			zap.String("deletedPath", chainDBPath),
+			zap.Uint64("rollbackHeight", safeRollbackHeight),
+			zap.Int("attempts", attempt+1),
+		)
+		lastErr = nil
+		break
+	}
+
+	if lastErr != nil {
+		b.Ctx.Log.Error("failed to delete VM state database after all retries",
 			zap.String("path", chainDBPath),
-			zap.Error(err),
+			zap.Error(lastErr),
+			zap.Int("totalAttempts", maxRetries),
 		)
 		// This is critical - can't recover without deleting state
 		return false
 	}
 
-	b.Ctx.Log.Info("deleted VM state database, forcing state rebuild from rollback height",
-		zap.String("deletedPath", chainDBPath),
-		zap.Uint64("rollbackHeight", safeRollbackHeight),
-	)
-
 	// Clear any corrupt in-memory state
 	b.missingBlockIDs.Clear()
-	b.outstandingRequests.Clear()
-	b.tree = interval.NewTree()
+	b.outstandingRequests = bimap.New[common.Request, ids.ID]()
+	b.tree, _ = interval.NewTree(b.DB)
 
-	b.Ctx.Log.Info("state corruption recovery complete - node will restart and rebuild state",
+	b.Ctx.Log.Info("state corruption recovery complete - forcing immediate shutdown to prevent database access",
 		zap.Uint64("rollbackHeight", safeRollbackHeight),
 		zap.Uint64("blocksToReprocess", checkpoint.Height-safeRollbackHeight),
 	)
 
-	// Return true to indicate successful recovery setup
-	// The handler will halt bootstrapping, node will restart, and resume from safe checkpoint
+	// CRITICAL: Force immediate clean exit to prevent any goroutines from accessing
+	// the deleted database. If we return here, the handler continues processing
+	// network messages for several seconds, causing FATAL crashes when those
+	// goroutines try to access the now-deleted database files.
+	//
+	// The node will be restarted by systemd and will resume from the safe checkpoint.
+	b.Ctx.Log.Warn("initiating immediate process exit for clean state recovery")
+	os.Exit(0)
+
+	// Unreachable, but keep for clarity
 	return true
 }
 
