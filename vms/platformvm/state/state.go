@@ -2573,7 +2573,15 @@ func (s *state) getInheritedPublicKey(nodeID ids.NodeID) (*bls.PublicKey, error)
 			return vdr.validator.PublicKey, nil
 		}
 	}
-	return nil, fmt.Errorf("%w: %s", errMissingPrimaryNetworkValidator, nodeID)
+
+	// During bootstrap with missing historical transactions, validators may have been removed
+	// but delegators referencing them may still be in the state. Log a warning and return
+	// nil public key instead of failing, allowing bootstrap to progress past these
+	// inconsistencies from early chain history.
+	s.ctx.Log.Warn("primary network validator not found when getting inherited public key",
+		zap.String("nodeID", nodeID.String()),
+	)
+	return nil, nil
 }
 
 // updateValidatorManager updates the validator manager with the pending
