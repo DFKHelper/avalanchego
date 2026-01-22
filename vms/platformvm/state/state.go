@@ -2551,9 +2551,18 @@ func (s *state) getInheritedPublicKey(nodeID ids.NodeID) (*bls.PublicKey, error)
 		// The primary network validator is present.
 		return vdr.validator.PublicKey, nil
 	}
-	if vdr, ok := s.currentStakers.validatorDiffs[constants.PrimaryNetworkID][nodeID]; ok && vdr.validator != nil {
-		// The primary network validator is being modified.
-		return vdr.validator.PublicKey, nil
+	if vdr, ok := s.currentStakers.validatorDiffs[constants.PrimaryNetworkID][nodeID]; ok {
+		// The primary network validator is being modified or deleted.
+		// If it's being deleted (e.g., due to missing AddValidatorTx during bootstrap),
+		// return nil instead of error to allow delegators to be processed gracefully.
+		if vdr.validatorStatus == deleted {
+			// Validator is being deleted - return nil public key without error.
+			// This allows delegators to be processed even when their validator is being removed.
+			return nil, nil
+		}
+		if vdr.validator != nil {
+			return vdr.validator.PublicKey, nil
+		}
 	}
 	return nil, fmt.Errorf("%w: %s", errMissingPrimaryNetworkValidator, nodeID)
 }
