@@ -501,6 +501,18 @@ func (e *proposalTxExecutor) rewardValidatorTx(uValidatorTx txs.ValidatorTx, val
 		validator.NodeID,
 	)
 	if err != nil {
+		// During bootstrap, if we can't find delegatee rewards (e.g., due to missing
+		// AddValidatorTx for this validator), skip the delegatee reward payout.
+		// This allows bootstrap to continue past validators with missing historical data.
+		if !e.backend.Bootstrapped.Get() {
+			e.backend.Ctx.Log.Warn("delegatee rewards not found during bootstrap, skipping delegatee reward payout",
+				zap.String("validatorTxID", validator.TxID.String()),
+				zap.String("nodeID", validator.NodeID.String()),
+				zap.String("subnetID", validator.SubnetID.String()),
+				zap.Error(err),
+			)
+			return nil
+		}
 		return fmt.Errorf("failed to fetch accrued delegatee rewards: %w", err)
 	}
 
