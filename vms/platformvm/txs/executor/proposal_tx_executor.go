@@ -570,12 +570,50 @@ func (e *proposalTxExecutor) rewardDelegatorTx(uDelegatorTx txs.DelegatorTx, del
 	// the validator they are delegated to.
 	validator, err := e.onCommitState.GetCurrentValidator(delegator.SubnetID, delegator.NodeID)
 	if err != nil {
+		// During bootstrap, if we can't find the validator, just remove the delegator
+		// without processing rewards. The validator may have been removed due to missing
+		// AddValidatorTx transaction.
+		if !e.backend.Bootstrapped.Get() {
+			e.backend.Ctx.Log.Warn("validator not found during bootstrap, removing delegator without rewards",
+				zap.String("delegatorTxID", delegator.TxID.String()),
+				zap.String("nodeID", delegator.NodeID.String()),
+				zap.String("subnetID", delegator.SubnetID.String()),
+				zap.Time("endTime", delegator.EndTime),
+				zap.Error(err),
+			)
+			// Just remove the delegator from the set and continue
+			// Stake already refunded above, no rewards - but bootstrap can progress
+			e.onCommitState.DeleteCurrentDelegator(delegator)
+			e.onAbortState.DeleteCurrentDelegator(delegator)
+			return nil
+		}
+
+		// During normal operation, this is a real error
 		return fmt.Errorf("failed to get whether %s is a validator: %w", delegator.NodeID, err)
 	}
 
 	vdrTxIntf, _, err := e.onCommitState.GetTx(validator.TxID)
 	if err != nil {
-		return fmt.Errorf("failed to get whether %s is a validator: %w", delegator.NodeID, err)
+		// During bootstrap, if we can't find the validator transaction, just remove the delegator
+		// without processing rewards.
+		if !e.backend.Bootstrapped.Get() {
+			e.backend.Ctx.Log.Warn("validator transaction not found during bootstrap, removing delegator without rewards",
+				zap.String("delegatorTxID", delegator.TxID.String()),
+				zap.String("validatorTxID", validator.TxID.String()),
+				zap.String("nodeID", delegator.NodeID.String()),
+				zap.String("subnetID", delegator.SubnetID.String()),
+				zap.Time("endTime", delegator.EndTime),
+				zap.Error(err),
+			)
+			// Just remove the delegator from the set and continue
+			// Stake already refunded above, no rewards - but bootstrap can progress
+			e.onCommitState.DeleteCurrentDelegator(delegator)
+			e.onAbortState.DeleteCurrentDelegator(delegator)
+			return nil
+		}
+
+		// During normal operation, this is a real error
+		return fmt.Errorf("failed to get validator tx for %s: %w", delegator.NodeID, err)
 	}
 
 	// Invariant: Delegators must only be able to reference validator
