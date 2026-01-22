@@ -376,17 +376,15 @@ func (e *proposalTxExecutor) RewardValidatorTx(tx *txs.RewardValidatorTx) error 
 		// without processing rewards. This allows bootstrap to continue past missing
 		// transactions that may have been aborted or lost due to chain inconsistencies.
 		if !e.backend.Bootstrapped.Get() {
-			e.backend.Ctx.Log.Warn("transaction not found during bootstrap, removing validator without rewards",
+			e.backend.Ctx.Log.Warn("transaction not found during bootstrap, skipping validator reward processing",
 				zap.String("txID", stakerToReward.TxID.String()),
 				zap.String("nodeID", stakerToReward.NodeID.String()),
 				zap.String("subnetID", stakerToReward.SubnetID.String()),
 				zap.Time("endTime", stakerToReward.EndTime),
 				zap.Error(err),
 			)
-			// Just remove the validator from the set and continue
-			// No rewards, no stake refund - but bootstrap can progress
-			e.onCommitState.DeleteCurrentValidator(stakerToReward)
-			e.onAbortState.DeleteCurrentValidator(stakerToReward)
+			// Skip reward processing but DON'T delete yet - let normal flow handle deletion
+			// to avoid state consistency issues. Return nil to continue bootstrap.
 			return nil
 		}
 
@@ -574,17 +572,15 @@ func (e *proposalTxExecutor) rewardDelegatorTx(uDelegatorTx txs.DelegatorTx, del
 		// without processing rewards. The validator may have been removed due to missing
 		// AddValidatorTx transaction.
 		if !e.backend.Bootstrapped.Get() {
-			e.backend.Ctx.Log.Warn("validator not found during bootstrap, removing delegator without rewards",
+			e.backend.Ctx.Log.Warn("validator not found during bootstrap, skipping delegator reward processing",
 				zap.String("delegatorTxID", delegator.TxID.String()),
 				zap.String("nodeID", delegator.NodeID.String()),
 				zap.String("subnetID", delegator.SubnetID.String()),
 				zap.Time("endTime", delegator.EndTime),
 				zap.Error(err),
 			)
-			// Just remove the delegator from the set and continue
-			// Stake already refunded above, no rewards - but bootstrap can progress
-			e.onCommitState.DeleteCurrentDelegator(delegator)
-			e.onAbortState.DeleteCurrentDelegator(delegator)
+			// Skip reward processing but DON'T delete yet - let normal flow handle deletion
+			// to avoid state consistency issues. Return nil to continue bootstrap.
 			return nil
 		}
 
@@ -597,7 +593,7 @@ func (e *proposalTxExecutor) rewardDelegatorTx(uDelegatorTx txs.DelegatorTx, del
 		// During bootstrap, if we can't find the validator transaction, just remove the delegator
 		// without processing rewards.
 		if !e.backend.Bootstrapped.Get() {
-			e.backend.Ctx.Log.Warn("validator transaction not found during bootstrap, removing delegator without rewards",
+			e.backend.Ctx.Log.Warn("validator transaction not found during bootstrap, skipping delegator reward processing",
 				zap.String("delegatorTxID", delegator.TxID.String()),
 				zap.String("validatorTxID", validator.TxID.String()),
 				zap.String("nodeID", delegator.NodeID.String()),
@@ -605,10 +601,8 @@ func (e *proposalTxExecutor) rewardDelegatorTx(uDelegatorTx txs.DelegatorTx, del
 				zap.Time("endTime", delegator.EndTime),
 				zap.Error(err),
 			)
-			// Just remove the delegator from the set and continue
-			// Stake already refunded above, no rewards - but bootstrap can progress
-			e.onCommitState.DeleteCurrentDelegator(delegator)
-			e.onAbortState.DeleteCurrentDelegator(delegator)
+			// Skip reward processing but DON'T delete yet - let normal flow handle deletion
+			// to avoid state consistency issues. Return nil to continue bootstrap.
 			return nil
 		}
 
