@@ -383,7 +383,36 @@ func (e *proposalTxExecutor) RewardValidatorTx(tx *txs.RewardValidatorTx) error 
 				zap.Time("endTime", stakerToReward.EndTime),
 				zap.Error(err),
 			)
-			// Must delete validator here since we're returning early
+
+			// Before deleting the validator, we must delete ALL its delegators to avoid
+			// orphaned delegators that would cause state consistency errors during commit.
+			delegatorIterator, err := e.onCommitState.GetCurrentDelegatorIterator(stakerToReward.SubnetID, stakerToReward.NodeID)
+			if err != nil {
+				return fmt.Errorf("failed to get delegator iterator for validator %s: %w", stakerToReward.NodeID, err)
+			}
+			defer delegatorIterator.Release()
+
+			delegatorCount := 0
+			for delegatorIterator.Next() {
+				delegator := delegatorIterator.Value()
+				e.onCommitState.DeleteCurrentDelegator(delegator)
+				e.onAbortState.DeleteCurrentDelegator(delegator)
+				delegatorCount++
+				e.backend.Ctx.Log.Warn("removing delegator without rewards (validator tx not found)",
+					zap.String("delegatorTxID", delegator.TxID.String()),
+					zap.String("validatorNodeID", stakerToReward.NodeID.String()),
+					zap.String("subnetID", stakerToReward.SubnetID.String()),
+				)
+			}
+
+			if delegatorCount > 0 {
+				e.backend.Ctx.Log.Info("removed delegators for validator with missing transaction",
+					zap.Int("count", delegatorCount),
+					zap.String("validatorNodeID", stakerToReward.NodeID.String()),
+				)
+			}
+
+			// Now delete the validator itself
 			// This maintains staker queue timing but skips reward processing
 			e.onCommitState.DeleteCurrentValidator(stakerToReward)
 			e.onAbortState.DeleteCurrentValidator(stakerToReward)
