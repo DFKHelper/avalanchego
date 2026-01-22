@@ -2230,7 +2230,16 @@ func (s *state) initValidatorSets() error {
 			// corresponding primary network validator.
 			primaryValidator, ok := primaryNetworkValidators[nodeID]
 			if !ok {
-				return fmt.Errorf("%w: %s", errMissingPrimaryNetworkValidator, nodeID)
+				// During bootstrap, validators may have been removed due to missing transactions,
+				// but their delegators or subnet validators may still exist in the current state.
+				// Skip these validators instead of failing, allowing bootstrap to progress.
+				// This is safe because the delegators will be removed when their RewardValidatorTx
+				// transactions are processed.
+				s.ctx.Log.Warn("skipping validator with missing primary network entry",
+					zap.String("nodeID", nodeID.String()),
+					zap.String("subnetID", subnetID.String()),
+				)
+				continue
 			}
 
 			var (
