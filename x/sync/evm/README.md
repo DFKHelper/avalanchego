@@ -4,13 +4,14 @@
 
 This package provides consolidated sync implementations for both **coreth** and **subnet-evm**, eliminating ~2,760 lines of duplicated code across handlers, client, and state sync components.
 
-## Current Status (Week 3)
+## Current Status (Week 4)
 
 - ✅ Package structure and interfaces
 - ✅ Config validation utilities (13 tests passing)
 - ✅ Handler foundation (5 tests passing)
 - ✅ **All three handlers consolidated** ✅
 - ✅ **Client consolidation complete** ✅
+- 🔄 **State syncer consolidation in progress** (Phase 1 complete)
 
 ## Code Reduction
 
@@ -53,10 +54,30 @@ This package provides consolidated sync implementations for both **coreth** and 
 - Client implementation: 290 LOC
 - Tests: 360 LOC
 
-### Remaining Work
+### State Syncer Consolidation (Week 4-5 - In Progress)
 
-**State Syncer (Week 4-5)**
-- state_syncer.go: ~900 LOC target savings
+**Analysis Phase Complete:**
+- Coreth: 451 LOC (blocking Sync() pattern)
+- Subnet-EVM: 921 LOC (async Start() + Wait() + Restart())
+- Difference: 470 LOC (advanced features: stuck detection, restart, error categorization)
+- Target: ~672 LOC savings (49% reduction)
+
+**Phase 1 Complete (Week 4):**
+- ✅ interfaces.go (175 LOC) - Interfaces, config structs, worker calculation
+- ✅ workers.go (105 LOC) - Adaptive worker/segment threshold calculation
+- ✅ code_sync_adapters.go (95 LOC) - Bridge CodeQueue vs codeSyncer
+- ✅ STATE-SYNCER-CONSOLIDATION-ANALYSIS.md - Detailed analysis document
+
+**Strategy:**
+- SyncMode enum (ModeBlocking for Coreth, ModeAsync for Subnet-EVM)
+- Optional features: stuck detection, restart, error categorization (Subnet-EVM only)
+- Code sync abstraction via adapters
+- Unified worker calculation with mode-aware defaults
+
+**Remaining (Week 4-5):**
+- Unified state_syncer.go implementation (~700 LOC)
+- Test coverage for both modes
+- Integration with coreth and subnet-evm (Week 6)
 
 ### Total Progress
 - **Handlers consolidated**: 491 LOC saved ✅
