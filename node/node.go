@@ -887,10 +887,6 @@ func (n *Node) runDatabaseHealthChecks(db database.Database) {
 			}
 
 			n.Log.Debug("database health check passed")
-
-		case <-n.onShutdownCtx.Done():
-			// Node is shutting down, stop health checks
-			return
 		}
 	}
 }
