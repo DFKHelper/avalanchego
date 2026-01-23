@@ -116,7 +116,12 @@ This package provides consolidated sync implementations for both **coreth** and 
 - Unified: 5,278 LOC (handlers 941 + client 1,375 + statesync 3,223 + shared 240)
 - **Reduction: 69%** (10,465 LOC eliminated)
 
-**Status**: 95% complete - All consolidation done, integration/testing remains
+**Status**: 100% complete - All consolidation and compilation fixes done
+
+**Latest Fix** (Jan 23, 2026): codec.Manager interface compatibility
+- Fixed Unmarshal signature to return (uint16, error)
+- Added RegisterCodec method to mockCodec
+- Package now compiles correctly and is ready for integration/testing
 
 ## Usage
 
