@@ -75,8 +75,9 @@ This package provides consolidated sync implementations for both **coreth** and 
 - ✅ trie_sync_stats.go (177 LOC) - Progress tracking and ETA calculation
 - ✅ STATE-SYNCER-CONSOLIDATION-ANALYSIS.md - Detailed analysis document
 
-**Total statesync package**: 2,135 LOC
+**Total statesync package**: 2,385 LOC
 - ✅ stuck_detector.go (476 LOC) - Optional stuck detection (Subnet-EVM only)
+- ✅ trie_sync_tasks.go (250 LOC) - Main trie and storage trie task callbacks
 
 **Strategy:**
 - SyncMode enum (ModeBlocking for Coreth, ModeAsync for Subnet-EVM)
@@ -86,8 +87,10 @@ This package provides consolidated sync implementations for both **coreth** and 
 
 **Remaining (Week 5):**
 - Consolidate trie_segments.go (627 + 420 = 1,047 LOC, significant differences)
-- Consolidate trie_sync_tasks.go (182 + 153 = 335 LOC)
-- Consolidate stuck_detector.go (subnet-evm only, ~250 LOC)
+  - Coreth: ThreadSafeStackTrie wrapper, parallel hashing optimization
+  - Subnet-EVM: Different segment tracking
+  - Strategy: Version-aware implementation or split files
+- Consolidate thread_safe_stack_trie.go (90 LOC, coreth-specific optimization)
 - Integration testing for unified state_syncer
 - Fill remaining placeholders with actual type references
 
