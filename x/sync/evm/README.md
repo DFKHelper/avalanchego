@@ -68,7 +68,12 @@ This package provides consolidated sync implementations for both **coreth** and 
 - ✅ code_sync_adapters.go (95 LOC) - Bridge CodeQueue vs codeSyncer
 - ✅ state_syncer.go (650 LOC) - Unified implementation with mode switching
 - ✅ state_syncer_test.go (300 LOC) - Configuration and mode tests
+- ✅ sync_helpers.go (42 LOC) - Common utility functions (100% identical)
+- ✅ trie_queue.go (124 LOC) - Storage trie queue (100% identical)
+- ✅ trie_sync_stats.go (177 LOC) - Progress tracking and ETA calculation
 - ✅ STATE-SYNCER-CONSOLIDATION-ANALYSIS.md - Detailed analysis document
+
+**Total statesync package**: 1,659 LOC
 
 **Strategy:**
 - SyncMode enum (ModeBlocking for Coreth, ModeAsync for Subnet-EVM)
@@ -76,16 +81,25 @@ This package provides consolidated sync implementations for both **coreth** and 
 - Code sync abstraction via adapters
 - Unified worker calculation with mode-aware defaults
 
-**Remaining (Week 4-5):**
-- Unified state_syncer.go implementation (~700 LOC)
-- Test coverage for both modes
-- Integration with coreth and subnet-evm (Week 6)
+**Remaining (Week 5):**
+- Consolidate trie_segments.go (627 + 420 = 1,047 LOC, significant differences)
+- Consolidate trie_sync_tasks.go (182 + 153 = 335 LOC)
+- Consolidate stuck_detector.go (subnet-evm only, ~250 LOC)
+- Integration testing for unified state_syncer
+- Fill remaining placeholders with actual type references
+
+**Week 6: Migration**
+- Integrate with coreth: replace imports, test bootstrap
+- Integrate with subnet-evm: replace imports, test bootstrap with stuck detection
+- Remove old sync code (~4,012 LOC)
 
 ### Total Progress
 - **Handlers consolidated**: 491 LOC saved ✅
-- **Client consolidated**: Unified implementation complete ✅
-- **Remaining**: State syncer (~900 LOC target)
-- **Total achieved**: ~1,320 LOC direct savings
+- **Client consolidated**: ~830 LOC functional consolidation ✅
+- **State syncer**: Foundation + common utilities complete (1,659 LOC)
+  - Common utilities: 343 LOC (100% consolidation of sync_helpers, trie_queue, trie_sync_stats)
+  - Core framework: 1,316 LOC (interfaces, workers, adapters, unified syncer)
+- **Total achieved**: ~1,664 LOC direct savings
 - **Total projected**: ~2,200 LOC reduction
 
 ## Usage
