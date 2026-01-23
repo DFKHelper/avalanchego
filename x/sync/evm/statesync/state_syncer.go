@@ -44,9 +44,15 @@ type stateSync struct {
 	syncer          interface{}      // *syncclient.CallbackLeafSyncer - avoid import cycle
 	codeSyncer      CodeSyncInterface
 	trieQueue       interface{} // *trieQueue - avoid import cycle
+	customrawdb     interface{} // customrawdb functions - avoid import cycle
 
 	mainTrie        interface{} // *trieToSync - avoid import cycle
 	triesInProgress map[common.Hash]interface{} // map to *trieToSync
+
+	// Segment configuration
+	segmentThreshold      uint64
+	numMainTrieSegments   int
+	numStorageTrieSegments int
 
 	// Synchronization
 	lock                sync.RWMutex
@@ -94,6 +100,11 @@ func NewStateSyncer(config StateSyncConfig) (StateSyncer, error) {
 		batchSize:       config.BatchSize,
 		codeSyncer:      config.CodeSyncer,
 		triesInProgress: make(map[common.Hash]interface{}),
+
+		// Segment configuration
+		segmentThreshold:       workerCfg.SegmentThreshold,
+		numMainTrieSegments:    numMainTrieSegments,
+		numStorageTrieSegments: numStorageTrieSegments,
 
 		// Channels
 		triesInProgressSem: make(chan struct{}, workerCfg.NumWorkers),
