@@ -66,6 +66,8 @@ This package provides consolidated sync implementations for both **coreth** and 
 - ✅ interfaces.go (175 LOC) - Interfaces, config structs, worker calculation
 - ✅ workers.go (105 LOC) - Adaptive worker/segment threshold calculation
 - ✅ code_sync_adapters.go (95 LOC) - Bridge CodeQueue vs codeSyncer
+- ✅ state_syncer.go (650 LOC) - Unified implementation with mode switching
+- ✅ state_syncer_test.go (300 LOC) - Configuration and mode tests
 - ✅ STATE-SYNCER-CONSOLIDATION-ANALYSIS.md - Detailed analysis document
 
 **Strategy:**
