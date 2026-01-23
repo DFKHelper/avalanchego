@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"math"
+	"runtime"
 	"slices"
 	"sync"
 	"time"
@@ -33,18 +35,18 @@ const (
 
 	// DefaultBlockCacheSize is the number of bytes to use for block caching in
 	// leveldb.
-	// Optimized for modern systems with sufficient RAM (8 GB cache).
-	DefaultBlockCacheSize = 8 * opt.GiB
+	// Reduced to 2GB to prevent memory pressure and swapping during bootstrap.
+	DefaultBlockCacheSize = 2 * opt.GiB
 
 	// DefaultWriteBufferSize is the number of bytes to use for buffers in
 	// leveldb.
-	// Optimized for bootstrap performance (1 GB, but halved to 512 MB in line 194).
-	DefaultWriteBufferSize = 1 * opt.GiB
+	// Reduced to 256MB to prevent memory pressure during compaction.
+	DefaultWriteBufferSize = 256 * opt.MiB
 
 	// DefaultHandleCap is the number of files descriptors to cap levelDB to
 	// use.
-	// Increased for better concurrent access and large databases.
-	DefaultHandleCap = 16384
+	// Reduced to 4096 to limit memory overhead from file caching.
+	DefaultHandleCap = 4096
 
 	// DefaultBitsPerKey is the number of bits to add to the bloom filter per
 	// key.
@@ -59,6 +61,12 @@ const (
 	// DefaultMetricUpdateFrequency is the frequency to poll the LevelDB
 	// metrics.
 	DefaultMetricUpdateFrequency = 10 * time.Second
+
+	// DefaultMemoryPressureCheckFrequency is the frequency to check for memory pressure.
+	DefaultMemoryPressureCheckFrequency = 30 * time.Second
+
+	// MemoryPressureThreshold is the percentage of heap allocation that triggers warnings.
+	MemoryPressureThreshold = 0.80 // 80% of heap
 
 	// levelDBByteOverhead is the number of bytes of constant overhead that
 	// should be added to a batch size per operation.
@@ -194,13 +202,13 @@ func New(file string, configBytes []byte, log logging.Logger, reg prometheus.Reg
 		BlockCacheCapacity:            DefaultBlockCacheSize,
 		DisableSeeksCompaction:        true,
 		OpenFilesCacheCapacity:        DefaultHandleCap,
-		WriteBuffer:                   DefaultWriteBufferSize / 2,
+		WriteBuffer:                   DefaultWriteBufferSize,
 		FilterBitsPerKey:              DefaultBitsPerKey,
 		MaxManifestFileSize:           DefaultMaxManifestFileSize,
 		MetricUpdateFrequency:         DefaultMetricUpdateFrequency,
-		CompactionL0Trigger:           12,   // Trigger compaction with more L0 files (default: 4)
-		CompactionTableSize:           16 * opt.MiB, // 16 MB table size
-		CompactionTotalSize:           100 * opt.MiB, // 100 MB total size for level
+		CompactionL0Trigger:           8,    // Trigger compaction earlier to reduce memory usage
+		CompactionTableSize:           8 * opt.MiB,  // Reduced table size
+		CompactionTotalSize:           50 * opt.MiB, // Reduced total size
 		CompactionTableSizeMultiplier: 2.0,
 		CompactionTotalSizeMultiplier: 10.0,
 	}
@@ -210,8 +218,23 @@ func New(file string, configBytes []byte, log logging.Logger, reg prometheus.Reg
 		}
 	}
 
+	// Validate memory configuration to prevent excessive memory pressure
+	memoryPressureCfg := DefaultMemoryPressureConfig()
+	if err := ValidateConfig(parsedConfig, memoryPressureCfg); err != nil {
+		// Check if it's a warning or a hard error
+		if stderrors.Is(err, ErrMemoryPressureWarning) {
+			log.Warn("database memory configuration may cause pressure",
+				zap.Error(err),
+				zap.String("estimated", GetMemoryEstimate(parsedConfig)),
+			)
+		} else if stderrors.Is(err, ErrMemoryConfigTooHigh) {
+			return nil, fmt.Errorf("unsafe database configuration: %w", err)
+		}
+	}
+
 	log.Info("creating leveldb",
 		zap.Reflect("config", parsedConfig),
+		zap.String("memoryEstimate", GetMemoryEstimate(parsedConfig)),
 	)
 
 	// Open the db and recover any potential corruptions
@@ -274,6 +297,40 @@ func New(file string, configBytes []byte, log logging.Logger, reg prometheus.Reg
 			}
 		}()
 	}
+
+	// Start memory pressure monitoring
+	wrappedDB.closeWg.Add(1)
+	go func() {
+		t := time.NewTicker(DefaultMemoryPressureCheckFrequency)
+		defer func() {
+			t.Stop()
+			wrappedDB.closeWg.Done()
+		}()
+
+		for {
+			select {
+			case <-t.C:
+				var m runtime.MemStats
+				runtime.ReadMemStats(&m)
+
+				// Calculate memory pressure (Alloc as percentage of heap)
+				if m.HeapSys > 0 {
+					pressure := float64(m.Alloc) / float64(m.HeapSys)
+					if pressure > MemoryPressureThreshold {
+						log.Warn("high memory pressure detected",
+							zap.Float64("pressure", pressure),
+							zap.Uint64("allocMB", m.Alloc/1024/1024),
+							zap.Uint64("heapSysMB", m.HeapSys/1024/1024),
+							zap.Uint64("numGC", uint64(m.NumGC)),
+						)
+					}
+				}
+			case <-wrappedDB.closeCh:
+				return
+			}
+		}
+	}()
+
 	return wrappedDB, nil
 }
 

@@ -6,7 +6,9 @@ package corruptabledb
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -144,11 +146,21 @@ func (db *Database) handleError(err error) error {
 		// corrupted() here since it would deadlock.
 		if db.initialError == nil {
 			db.log.Error(
-				"closing database to avoid possible corruption",
+				"database corruption detected - initiating graceful shutdown",
 				zap.Error(err),
 			)
 
 			db.initialError = fmt.Errorf("closed to avoid possible corruption, init error: %w", err)
+
+			// Trigger graceful shutdown after a delay to allow logging to flush
+			go func() {
+				time.Sleep(5 * time.Second)
+				db.log.Fatal(
+					"shutting down node due to database corruption",
+					zap.Error(err),
+				)
+				os.Exit(1)
+			}()
 		}
 	}
 	return err

@@ -811,6 +811,9 @@ func (n *Node) initDatabase() error {
 		return err
 	}
 
+	// Start periodic database health checks
+	go n.runDatabaseHealthChecks(db)
+
 	rawExpectedGenesisHash := hashing.ComputeHash256(n.Config.GenesisBytes)
 
 	rawGenesisHash, err := n.DB.Get(genesisHashKey)
@@ -856,6 +859,40 @@ func (n *Node) initDatabase() error {
 	}
 
 	return nil
+}
+
+// runDatabaseHealthChecks performs periodic health checks on the database
+// to detect potential corruption or issues early.
+// Runs in a separate goroutine for the lifetime of the node.
+func (n *Node) runDatabaseHealthChecks(db database.Database) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, err := db.HealthCheck(ctx)
+			cancel()
+
+			if err != nil {
+				n.Log.Error("database health check failed - potential corruption detected",
+					zap.Error(err),
+				)
+
+				// Trigger graceful shutdown if health check fails
+				// This prevents further damage to the database
+				n.Log.Fatal("shutting down node due to database health check failure")
+				os.Exit(1)
+			}
+
+			n.Log.Debug("database health check passed")
+
+		case <-n.onShutdownCtx.Done():
+			// Node is shutting down, stop health checks
+			return
+		}
+	}
 }
 
 // createChainDatabase creates a separate database for a specific chain.
