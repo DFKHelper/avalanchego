@@ -4,6 +4,7 @@
 package leveldb
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -19,7 +20,7 @@ func TestInterface(t *testing.T) {
 	for name, test := range dbtest.Tests {
 		t.Run(name, func(t *testing.T) {
 			folder := t.TempDir()
-			db, err := New(folder, nil, logging.NoLog{}, prometheus.NewRegistry())
+			db, err := New(folder, testConfig(), logging.NoLog{}, prometheus.NewRegistry())
 			require.NoError(t, err)
 
 			test(t, db)
@@ -29,9 +30,22 @@ func TestInterface(t *testing.T) {
 	}
 }
 
+// testConfig returns a minimal configuration suitable for testing
+// that won't trigger memory validation errors in test environments
+func testConfig() []byte {
+	cfg := map[string]interface{}{
+		"blockCacheCapacity":      12 * 1024 * 1024,  // 12 MB (minimal)
+		"writeBuffer":             4 * 1024 * 1024,   // 4 MB
+		"openFilesCacheCapacity":  128,               // Minimal file cache
+		"filterBitsPerKey":        DefaultBitsPerKey,
+	}
+	configBytes, _ := json.Marshal(cfg)
+	return configBytes
+}
+
 func newDB(t testing.TB) database.Database {
 	folder := t.TempDir()
-	db, err := New(folder, nil, logging.NoLog{}, prometheus.NewRegistry())
+	db, err := New(folder, testConfig(), logging.NoLog{}, prometheus.NewRegistry())
 	require.NoError(t, err)
 	return db
 }

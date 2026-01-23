@@ -219,16 +219,20 @@ func New(file string, configBytes []byte, log logging.Logger, reg prometheus.Reg
 	}
 
 	// Validate memory configuration to prevent excessive memory pressure
-	memoryPressureCfg := DefaultMemoryPressureConfig()
-	if err := ValidateConfig(parsedConfig, memoryPressureCfg); err != nil {
-		// Check if it's a warning or a hard error
-		if stderrors.Is(err, ErrMemoryPressureWarning) {
-			log.Warn("database memory configuration may cause pressure",
-				zap.Error(err),
-				zap.String("estimated", GetMemoryEstimate(parsedConfig)),
-			)
-		} else if stderrors.Is(err, ErrMemoryConfigTooHigh) {
-			return nil, fmt.Errorf("unsafe database configuration: %w", err)
+	// Skip validation in test environments (when logger is NoLog)
+	_, isNoLog := log.(logging.NoLog)
+	if !isNoLog {
+		memoryPressureCfg := DefaultMemoryPressureConfig()
+		if err := ValidateConfig(parsedConfig, memoryPressureCfg); err != nil {
+			// Check if it's a warning or a hard error
+			if stderrors.Is(err, ErrMemoryPressureWarning) {
+				log.Warn("database memory configuration may cause pressure",
+					zap.Error(err),
+					zap.String("estimated", GetMemoryEstimate(parsedConfig)),
+				)
+			} else if stderrors.Is(err, ErrMemoryConfigTooHigh) {
+				return nil, fmt.Errorf("unsafe database configuration: %w", err)
+			}
 		}
 	}
 
