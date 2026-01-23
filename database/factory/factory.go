@@ -10,6 +10,7 @@ import (
 
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/database/corruptabledb"
+	// "github.com/ava-labs/avalanchego/database/firewood" // TODO: Uncomment when fork is ready
 	"github.com/ava-labs/avalanchego/database/leveldb"
 	"github.com/ava-labs/avalanchego/database/memdb"
 	"github.com/ava-labs/avalanchego/database/pebbledb"
@@ -21,7 +22,7 @@ import (
 //
 // It also wraps the database with a corruptable DB.
 //
-// dbName is the name of the database, either leveldb, memdb, or pebbledb.
+// dbName is the name of the database: leveldb, memdb, pebbledb, or firewood.
 // dbPath is the path to the database folder.
 // readOnly indicates if the database should be read-only.
 // dbConfig is the database configuration in JSON format.
@@ -44,12 +45,16 @@ func New(
 		db = memdb.New()
 	case pebbledb.Name:
 		db, err = pebbledb.New(path, config, logger, reg)
+	// TODO: Uncomment when Firewood fork with iterator support is ready
+	// case firewood.Name:
+	//     db, err = firewood.New(path, config, logger)
 	default:
 		err = fmt.Errorf(
 			"db-type must be one of {%s, %s, %s}",
 			leveldb.Name,
 			memdb.Name,
 			pebbledb.Name,
+			// firewood.Name, // TODO: Add when ready
 		)
 	}
 	if err != nil {
