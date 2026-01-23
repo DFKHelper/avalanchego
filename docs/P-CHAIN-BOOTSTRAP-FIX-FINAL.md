@@ -12,41 +12,62 @@ This affected validators from early 2021 whose transactions are not in the commi
 ## Solution
 
 **File**: `vms/platformvm/txs/executor/proposal_tx_executor.go`
-**Commit**: 89d26cded
+**Commits**: 89d26cded (initial), c4c58716f (delegators), 250497b5e (state consistency fix)
 
-During bootstrap, when a validator's AddValidatorTx cannot be found:
-1. Log a WARN message with validator details
-2. Remove the validator from the current validator set
-3. **Skip reward processing** (no stake refund, no rewards)
-4. Return success and continue bootstrap
+### Approach Evolution
 
-### Code Change
+**Initial Approach** (commits 89d26cded, c4c58716f): Delete validators/delegators in error handlers
+- **Problem**: Created state inconsistencies during commit validation
+- **Error**: "missing primary network validator" FATAL during database commit
+
+**Final Approach** (commit 250497b5e): Skip reward processing, let normal flow handle deletion
+
+### How It Works
+
+When a validator/delegator's transaction cannot be found during bootstrap:
+
+1. **Log WARN message** with entity details
+2. **Skip reward processing** (no rewards calculated or paid)
+3. **Return nil (success)** to continue bootstrap
+4. **Normal deletion flow** handles entity removal (RewardValidatorTx lines 412-413/420-421)
+
+This maintains state consistency because:
+- Deletions happen through standard code paths
+- State commit validation passes
+- No orphaned references between validators and delegators
+
+The fix only applies during bootstrap; normal operation still returns errors for safety.
+
+### Code Change (Final Version)
 
 ```go
 stakerTx, _, err := e.onCommitState.GetTx(stakerToReward.TxID)
 if err != nil {
-    // During bootstrap, if we can't find the transaction, just remove the validator
-    // without processing rewards. This allows bootstrap to continue past missing
-    // transactions that may have been aborted or lost due to chain inconsistencies.
+    // During bootstrap, if we can't find the transaction, skip reward processing
+    // and let normal flow handle deletion. This maintains state consistency.
     if !e.backend.Bootstrapped.Get() {
-        e.backend.Ctx.Log.Warn("transaction not found during bootstrap, removing validator without rewards",
+        e.backend.Ctx.Log.Warn("transaction not found during bootstrap, skipping validator reward processing",
             zap.String("txID", stakerToReward.TxID.String()),
             zap.String("nodeID", stakerToReward.NodeID.String()),
             zap.String("subnetID", stakerToReward.SubnetID.String()),
             zap.Time("endTime", stakerToReward.EndTime),
             zap.Error(err),
         )
-        // Just remove the validator from the set and continue
-        // No rewards, no stake refund - but bootstrap can progress
-        e.onCommitState.DeleteCurrentValidator(stakerToReward)
-        e.onAbortState.DeleteCurrentValidator(stakerToReward)
+        // Skip reward processing but DON'T delete yet - let normal flow handle deletion
+        // to avoid state consistency issues. Return nil to continue bootstrap.
         return nil
     }
 
     // During normal operation, this is a real error
     return fmt.Errorf("failed to get next removed staker tx %s ...: %w", ...)
 }
+
+// After reward processing, normal flow deletes validator (lines 412-413):
+e.onCommitState.DeleteCurrentValidator(stakerToReward)
+e.onAbortState.DeleteCurrentValidator(stakerToReward)
 ```
+
+Same approach applied to delegator reward processing in `rewardDelegatorTx` function.
 
 ## Verification Results
 
