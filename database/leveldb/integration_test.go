@@ -149,7 +149,9 @@ func TestDatabaseRecovery_Integration(t *testing.T) {
 	require.NoError(err)
 
 	// Reopen database - should work without issues
-	db2, err := New(dbPath, nil, log, reg)
+	// Use a new registry to avoid duplicate metrics registration
+	reg2 := prometheus.NewRegistry()
+	db2, err := New(dbPath, nil, log, reg2)
 	require.NoError(err)
 
 	// Verify data persisted
