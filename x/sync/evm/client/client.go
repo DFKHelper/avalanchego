@@ -232,7 +232,7 @@ func (c *client) requestWithRetry(
 
 		// Unmarshal response
 		var response interface{}
-		if err := c.codec.Unmarshal(responseBytes, &response); err != nil {
+		if _, err := c.codec.Unmarshal(responseBytes, &response); err != nil {
 			// Unmarshal failed - treat as peer failure
 			c.peerManager.RecordFailure(peerID)
 			lastErr = fmt.Errorf("%w: %v", ErrUnmarshalResponse, err)

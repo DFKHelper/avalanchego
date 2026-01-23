@@ -50,7 +50,11 @@ func (m *mockNetworkClient) SendAppRequest(ctx context.Context, nodeID ids.NodeI
 
 type mockCodec struct {
 	marshalFunc   func(uint16, interface{}) ([]byte, error)
-	unmarshalFunc func([]byte, interface{}) error
+	unmarshalFunc func([]byte, interface{}) (uint16, error)
+}
+
+func (m *mockCodec) RegisterCodec(version uint16, codec codec.Codec) error {
+	return nil
 }
 
 func (m *mockCodec) Marshal(version uint16, v interface{}) ([]byte, error) {
@@ -60,11 +64,11 @@ func (m *mockCodec) Marshal(version uint16, v interface{}) ([]byte, error) {
 	return []byte("marshaled"), nil
 }
 
-func (m *mockCodec) Unmarshal(bytes []byte, v interface{}) error {
+func (m *mockCodec) Unmarshal(bytes []byte, v interface{}) (uint16, error) {
 	if m.unmarshalFunc != nil {
 		return m.unmarshalFunc(bytes, v)
 	}
-	return nil
+	return 0, nil
 }
 
 func (m *mockCodec) Size(version uint16, v interface{}) (int, error) {
