@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -24,11 +23,6 @@ const (
 
 	// DefaultFlushSize is the default number of operations before auto-flush
 	DefaultFlushSize = 1000
-)
-
-var (
-	ErrClosed      = errors.New("database closed")
-	ErrKeyNotFound = errors.New("key not found")
 )
 
 // Database implements the database.Database interface using Firewood.
@@ -162,7 +156,7 @@ func (db *Database) flushLocked() error {
 // Has implements database.KeyValueReader
 func (db *Database) Has(key []byte) (bool, error) {
 	if db.closed.Load() {
-		return false, ErrClosed
+		return false, database.ErrClosed
 	}
 
 	db.pendingMu.Lock()
@@ -187,7 +181,7 @@ func (db *Database) Has(key []byte) (bool, error) {
 // Provides read-your-writes consistency by checking pending batch first.
 func (db *Database) Get(key []byte) ([]byte, error) {
 	if db.closed.Load() {
-		return nil, ErrClosed
+		return nil, database.ErrClosed
 	}
 
 	db.pendingMu.Lock()
@@ -222,7 +216,7 @@ func (db *Database) Get(key []byte) ([]byte, error) {
 // Adds operation to pending batch and auto-flushes when threshold reached.
 func (db *Database) Put(key []byte, value []byte) error {
 	if db.closed.Load() {
-		return ErrClosed
+		return database.ErrClosed
 	}
 
 	db.pendingMu.Lock()
@@ -253,7 +247,7 @@ func (db *Database) Put(key []byte, value []byte) error {
 // Adds delete operation to pending batch and auto-flushes when threshold reached.
 func (db *Database) Delete(key []byte) error {
 	if db.closed.Load() {
-		return ErrClosed
+		return database.ErrClosed
 	}
 
 	db.pendingMu.Lock()
@@ -325,7 +319,7 @@ func (db *Database) preparePendingOpsLocked(start, prefix []byte) []pendingKV {
 // Returns merge iterator combining committed state + pending writes
 func (db *Database) NewIterator() database.Iterator {
 	if db.closed.Load() {
-		return newErrorIterator(ErrClosed)
+		return newErrorIterator(database.ErrClosed)
 	}
 
 	db.pendingMu.Lock()
@@ -352,7 +346,7 @@ func (db *Database) NewIterator() database.Iterator {
 // NewIteratorWithStart implements database.Iteratee
 func (db *Database) NewIteratorWithStart(start []byte) database.Iterator {
 	if db.closed.Load() {
-		return newErrorIterator(ErrClosed)
+		return newErrorIterator(database.ErrClosed)
 	}
 
 	db.pendingMu.Lock()
@@ -379,7 +373,7 @@ func (db *Database) NewIteratorWithStart(start []byte) database.Iterator {
 // NewIteratorWithPrefix implements database.Iteratee
 func (db *Database) NewIteratorWithPrefix(prefix []byte) database.Iterator {
 	if db.closed.Load() {
-		return newErrorIterator(ErrClosed)
+		return newErrorIterator(database.ErrClosed)
 	}
 
 	db.pendingMu.Lock()
@@ -406,7 +400,7 @@ func (db *Database) NewIteratorWithPrefix(prefix []byte) database.Iterator {
 // NewIteratorWithStartAndPrefix implements database.Iteratee
 func (db *Database) NewIteratorWithStartAndPrefix(start, prefix []byte) database.Iterator {
 	if db.closed.Load() {
-		return newErrorIterator(ErrClosed)
+		return newErrorIterator(database.ErrClosed)
 	}
 
 	db.pendingMu.Lock()
@@ -444,7 +438,7 @@ func (db *Database) Compact(start []byte, limit []byte) error {
 // Flushes pending writes and closes the underlying Firewood database.
 func (db *Database) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
-		return ErrClosed
+		return database.ErrClosed
 	}
 
 	db.pendingMu.Lock()
@@ -472,7 +466,7 @@ func (db *Database) Close() error {
 // HealthCheck implements health.Checker
 func (db *Database) HealthCheck(ctx context.Context) (interface{}, error) {
 	if db.closed.Load() {
-		return nil, ErrClosed
+		return nil, database.ErrClosed
 	}
 
 	db.pendingMu.Lock()
@@ -539,11 +533,22 @@ func (b *batch) Size() int {
 
 func (b *batch) Write() error {
 	if b.db.closed.Load() {
-		return ErrClosed
+		return database.ErrClosed
 	}
 
 	if len(b.ops) == 0 {
 		return nil
+	}
+
+	// IMPORTANT: Flush database pending batch first to maintain consistency
+	// This ensures batch operations see the latest state and don't conflict
+	b.db.pendingMu.Lock()
+	defer b.db.pendingMu.Unlock()
+
+	if len(b.db.pending.ops) > 0 {
+		if err := b.db.flushLocked(); err != nil {
+			return fmt.Errorf("failed to flush pending before batch: %w", err)
+		}
 	}
 
 	// Collect keys and values for proposal

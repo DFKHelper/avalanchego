@@ -62,7 +62,7 @@ func newIterator(fw *ffi.Iterator, pending []pendingKV, log logging.Logger) *ite
 // Returns true if the iterator is pointing at a valid entry and false if not.
 func (it *iterator) Next() bool {
 	if it.released {
-		it.err = ErrClosed
+		it.err = database.ErrClosed
 		return false
 	}
 
