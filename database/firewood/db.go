@@ -4,49 +4,70 @@
 package firewood
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"sync"
+	"sync/atomic"
 
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/utils/logging"
-
-	// TODO: Replace with forked version once iterator support is added
-	// "github.com/YOUR-FORK/firewood-go-ethhash/ffi"
+	"github.com/ava-labs/firewood-go-ethhash/ffi"
 )
 
 const (
 	// Name is the name of this database for database switches
 	Name = "firewood"
+
+	// DefaultFlushSize is the default number of operations before auto-flush
+	DefaultFlushSize = 1000
 )
 
 var (
-	ErrIteratorNotImplemented = errors.New("iterator support pending firewood fork implementation")
-	ErrClosed                 = errors.New("database closed")
+	ErrClosed      = errors.New("database closed")
+	ErrKeyNotFound = errors.New("key not found")
 )
 
 // Database implements the database.Database interface using Firewood.
 //
-// Current Status: PLACEHOLDER - Awaiting Firewood fork with iterator support
+// Architecture: Batch-based adapter with auto-flush
+// - Firewood uses proposal/commit pattern (batch operations)
+// - database.Database expects immediate Put/Get operations
+// - Adapter accumulates writes in pending batch
+// - Auto-flushes when batch reaches threshold (default: 1000 ops)
+// - Provides read-your-writes consistency by checking pending batch first
 //
-// Implementation Plan:
-// 1. Fork github.com/ava-labs/firewood (Rust implementation)
-// 2. Fork github.com/ava-labs/firewood-go-ethhash (Go FFI bindings)
-// 3. Implement iterator in Rust:
-//    - Add db.iter(), db.iter_from(), db.iter_prefix() to firewood/src/db.rs
-//    - Create firewood/src/iterator.rs with DatabaseIterator struct
-// 4. Add FFI bindings for iterator in firewood-go-ethhash/ffi/database.go
-// 5. Update this file to use forked version with iterator support
-//
-// Timeline: Weeks 4-5 (Phase 2: AvalancheGo Adapter)
+// See ARCHITECTURE_NOTES.md for detailed design rationale.
 type Database struct {
-	// TODO: Uncomment once fork is ready
-	// fw    *ffi.Database
-	// log   logging.Logger
-	// ctx   context.Context
-	// closed atomic.Bool
+	fw     *ffi.Database
+	log    logging.Logger
+	closed atomic.Bool
 
-	log logging.Logger
+	// Pending batch tracking for auto-flush
+	pendingMu    sync.Mutex
+	pending      *pendingBatch // Accumulates writes until flush
+	flushSize    int           // Auto-flush threshold
+	flushOnClose bool          // Whether to flush pending writes on close
+}
+
+// pendingBatch tracks writes that haven't been committed to Firewood yet
+type pendingBatch struct {
+	ops map[string]*pendingOp // key -> operation (using string key for map)
+}
+
+type pendingOp struct {
+	key    []byte
+	value  []byte // nil for delete
+	delete bool
+}
+
+func newPendingBatch() *pendingBatch {
+	return &pendingBatch{
+		ops: make(map[string]*pendingOp),
+	}
 }
 
 // New creates a new Firewood database instance.
@@ -58,133 +79,363 @@ type Database struct {
 //
 // Returns database.Database implementation or error if initialization fails.
 func New(file string, configBytes []byte, log logging.Logger) (database.Database, error) {
-	log.Warn("Firewood database adapter is a placeholder - awaiting iterator implementation in fork")
+	// Parse configuration
+	var cfg Config
+	if len(configBytes) > 0 {
+		if err := json.Unmarshal(configBytes, &cfg); err != nil {
+			return nil, fmt.Errorf("failed to parse firewood config: %w", err)
+		}
+	} else {
+		// Use default config if none provided
+		cfg = DefaultConfig()
+	}
 
-	// TODO: Parse config from configBytes
-	// var cfg Config
-	// if err := json.Unmarshal(configBytes, &cfg); err != nil {
-	//     return nil, fmt.Errorf("failed to parse config: %w", err)
-	// }
+	// Build FFI options from config
+	options := []ffi.Option{
+		ffi.WithNodeCacheEntries(cfg.CacheSizeBytes / 256), // ~256 bytes per node
+		ffi.WithFreeListCacheEntries(cfg.FreeListCacheEntries),
+		ffi.WithRevisions(cfg.RevisionsInMemory),
+		ffi.WithReadCacheStrategy(cfg.CacheStrategy),
+	}
 
-	// TODO: Initialize Firewood database from fork
-	// fw, err := ffi.OpenDatabase(file, cfg.toFFIConfig())
-	// if err != nil {
-	//     return nil, fmt.Errorf("failed to open firewood database: %w", err)
-	// }
+	// Open Firewood database
+	fw, err := ffi.New(file, options...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open firewood database: %w", err)
+	}
+
+	log.Info("Firewood database opened successfully",
+		"path", file,
+		"cacheSize", cfg.CacheSizeBytes,
+		"revisions", cfg.RevisionsInMemory,
+	)
+
+	flushSize := cfg.FlushSize
+	if flushSize == 0 {
+		flushSize = DefaultFlushSize
+	}
 
 	return &Database{
-		log: log,
+		fw:           fw,
+		log:          log,
+		pending:      newPendingBatch(),
+		flushSize:    flushSize,
+		flushOnClose: true,
 	}, nil
+}
+
+// flushLocked commits pending writes to Firewood.
+// Caller must hold pendingMu lock.
+func (db *Database) flushLocked() error {
+	if len(db.pending.ops) == 0 {
+		return nil
+	}
+
+	// Collect keys and values for proposal
+	keys := make([][]byte, 0, len(db.pending.ops))
+	values := make([][]byte, 0, len(db.pending.ops))
+
+	for _, op := range db.pending.ops {
+		keys = append(keys, op.key)
+		if op.delete {
+			values = append(values, nil) // nil value = delete
+		} else {
+			values = append(values, op.value)
+		}
+	}
+
+	// Create proposal
+	proposal, err := db.fw.Propose(keys, values)
+	if err != nil {
+		return fmt.Errorf("firewood propose failed: %w", err)
+	}
+
+	// Commit proposal
+	if err := proposal.Commit(); err != nil {
+		return fmt.Errorf("firewood commit failed: %w", err)
+	}
+
+	// Clear pending batch
+	db.pending = newPendingBatch()
+
+	db.log.Debug("Flushed pending batch",
+		"operations", len(keys),
+	)
+
+	return nil
 }
 
 // Has implements database.KeyValueReader
 func (db *Database) Has(key []byte) (bool, error) {
-	// TODO: Implement using forked Firewood
-	// if db.closed.Load() {
-	//     return false, ErrClosed
-	// }
-	// return db.fw.Has(key)
-	return false, ErrIteratorNotImplemented
+	if db.closed.Load() {
+		return false, ErrClosed
+	}
+
+	db.pendingMu.Lock()
+	defer db.pendingMu.Unlock()
+
+	// Check pending batch first
+	if op, exists := db.pending.ops[string(key)]; exists {
+		return !op.delete, nil // exists if not a delete operation
+	}
+
+	// Check committed state in Firewood
+	_, err := db.fw.Get(key)
+	if err != nil {
+		if errors.Is(err, ffi.ErrKeyNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return true, nil
 }
 
 // Get implements database.KeyValueReader
+// Provides read-your-writes consistency by checking pending batch first.
 func (db *Database) Get(key []byte) ([]byte, error) {
-	// TODO: Implement using forked Firewood
-	// if db.closed.Load() {
-	//     return nil, ErrClosed
-	// }
-	// value, err := db.fw.Get(key)
-	// if err != nil {
-	//     if errors.Is(err, ffi.ErrNotFound) {
-	//         return nil, database.ErrNotFound
-	//     }
-	//     return nil, err
-	// }
-	// return value, nil
-	return nil, ErrIteratorNotImplemented
+	if db.closed.Load() {
+		return nil, ErrClosed
+	}
+
+	db.pendingMu.Lock()
+	defer db.pendingMu.Unlock()
+
+	// Check pending batch first (read-your-writes consistency)
+	if op, exists := db.pending.ops[string(key)]; exists {
+		if op.delete {
+			return nil, database.ErrNotFound // Pending delete
+		}
+		// Return copy to prevent caller from modifying pending batch
+		result := make([]byte, len(op.value))
+		copy(result, op.value)
+		return result, nil
+	}
+
+	// Check committed state in Firewood
+	value, err := db.fw.Get(key)
+	if err != nil {
+		if errors.Is(err, ffi.ErrKeyNotFound) {
+			return nil, database.ErrNotFound
+		}
+		return nil, err
+	}
+
+	return value, nil
 }
 
 // Put implements database.KeyValueWriter
+// Adds operation to pending batch and auto-flushes when threshold reached.
 func (db *Database) Put(key []byte, value []byte) error {
-	// TODO: Implement using forked Firewood
-	// if db.closed.Load() {
-	//     return ErrClosed
-	// }
-	// return db.fw.Put(key, value)
-	return ErrIteratorNotImplemented
+	if db.closed.Load() {
+		return ErrClosed
+	}
+
+	db.pendingMu.Lock()
+	defer db.pendingMu.Unlock()
+
+	// Make copies to prevent caller from modifying our internal state
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+	valueCopy := make([]byte, len(value))
+	copy(valueCopy, value)
+
+	// Add to pending batch
+	db.pending.ops[string(keyCopy)] = &pendingOp{
+		key:    keyCopy,
+		value:  valueCopy,
+		delete: false,
+	}
+
+	// Auto-flush if threshold reached
+	if len(db.pending.ops) >= db.flushSize {
+		return db.flushLocked()
+	}
+
+	return nil
 }
 
 // Delete implements database.KeyValueDeleter
+// Adds delete operation to pending batch and auto-flushes when threshold reached.
 func (db *Database) Delete(key []byte) error {
-	// TODO: Implement using forked Firewood
-	// if db.closed.Load() {
-	//     return ErrClosed
-	// }
-	// return db.fw.Delete(key)
-	return ErrIteratorNotImplemented
+	if db.closed.Load() {
+		return ErrClosed
+	}
+
+	db.pendingMu.Lock()
+	defer db.pendingMu.Unlock()
+
+	// Make copy to prevent caller from modifying our internal state
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+
+	// Add to pending batch as delete operation
+	db.pending.ops[string(keyCopy)] = &pendingOp{
+		key:    keyCopy,
+		value:  nil,
+		delete: true,
+	}
+
+	// Auto-flush if threshold reached
+	if len(db.pending.ops) >= db.flushSize {
+		return db.flushLocked()
+	}
+
+	return nil
 }
 
 // NewBatch implements database.Batcher
+// Returns a batch that accumulates operations and commits them atomically on Write().
+// Note: Explicit batches do NOT auto-flush - only Write() commits them.
 func (db *Database) NewBatch() database.Batch {
-	// TODO: Implement batch operations
-	// return &batch{
-	//     db:   db,
-	//     ops:  make([]database.BatchOp, 0, 256),
-	// }
-	return &batch{db: db}
+	return &batch{
+		db:  db,
+		ops: make(map[string]*pendingOp),
+	}
+}
+
+// preparePendingOps converts pending batch to sorted slice for merge iteration
+// Caller must hold pendingMu lock
+func (db *Database) preparePendingOpsLocked(start, prefix []byte) []pendingKV {
+	if len(db.pending.ops) == 0 {
+		return nil
+	}
+
+	// Convert map to slice
+	pending := make([]pendingKV, 0, len(db.pending.ops))
+	for _, op := range db.pending.ops {
+		// Filter by prefix if specified
+		if len(prefix) > 0 && !bytes.HasPrefix(op.key, prefix) {
+			continue
+		}
+		// Filter by start if specified
+		if len(start) > 0 && bytes.Compare(op.key, start) < 0 {
+			continue
+		}
+		pending = append(pending, pendingKV{
+			key:    op.key,
+			value:  op.value,
+			delete: op.delete,
+		})
+	}
+
+	// Sort by key for merge iteration
+	sort.Slice(pending, func(i, j int) bool {
+		return bytes.Compare(pending[i].key, pending[j].key) < 0
+	})
+
+	return pending
 }
 
 // NewIterator implements database.Iteratee
-// CRITICAL: This requires iterator support in Firewood fork
+// Returns merge iterator combining committed state + pending writes
 func (db *Database) NewIterator() database.Iterator {
-	// TODO: Implement once fork has iterator support
-	// if db.closed.Load() {
-	//     return newErrorIterator(ErrClosed)
-	// }
-	// fwIter := db.fw.NewIterator()
-	// return &iterator{
-	//     fw:  fwIter,
-	//     log: db.log,
-	// }
-	return newErrorIterator(ErrIteratorNotImplemented)
+	if db.closed.Load() {
+		return newErrorIterator(ErrClosed)
+	}
+
+	db.pendingMu.Lock()
+	defer db.pendingMu.Unlock()
+
+	// Get latest revision from Firewood
+	rev, err := db.fw.LatestRevision()
+	if err != nil {
+		return newErrorIterator(fmt.Errorf("failed to get latest revision: %w", err))
+	}
+
+	// Create FFI iterator starting from beginning (empty slice)
+	fwIter, err := rev.Iter([]byte{})
+	if err != nil {
+		return newErrorIterator(fmt.Errorf("failed to create iterator: %w", err))
+	}
+
+	// Prepare pending operations
+	pending := db.preparePendingOpsLocked(nil, nil)
+
+	return newIterator(fwIter, pending, db.log)
 }
 
 // NewIteratorWithStart implements database.Iteratee
 func (db *Database) NewIteratorWithStart(start []byte) database.Iterator {
-	// TODO: Implement once fork has iterator support
-	// if db.closed.Load() {
-	//     return newErrorIterator(ErrClosed)
-	// }
-	// fwIter := db.fw.NewIteratorFrom(start)
-	// return &iterator{
-	//     fw:  fwIter,
-	//     log: db.log,
-	// }
-	return newErrorIterator(ErrIteratorNotImplemented)
+	if db.closed.Load() {
+		return newErrorIterator(ErrClosed)
+	}
+
+	db.pendingMu.Lock()
+	defer db.pendingMu.Unlock()
+
+	// Get latest revision from Firewood
+	rev, err := db.fw.LatestRevision()
+	if err != nil {
+		return newErrorIterator(fmt.Errorf("failed to get latest revision: %w", err))
+	}
+
+	// Create FFI iterator starting from start key
+	fwIter, err := rev.Iter(start)
+	if err != nil {
+		return newErrorIterator(fmt.Errorf("failed to create iterator: %w", err))
+	}
+
+	// Prepare pending operations (filtered by start)
+	pending := db.preparePendingOpsLocked(start, nil)
+
+	return newIterator(fwIter, pending, db.log)
 }
 
 // NewIteratorWithPrefix implements database.Iteratee
 func (db *Database) NewIteratorWithPrefix(prefix []byte) database.Iterator {
-	// TODO: Implement once fork has iterator support
-	// if db.closed.Load() {
-	//     return newErrorIterator(ErrClosed)
-	// }
-	// fwIter := db.fw.NewIteratorPrefix(prefix)
-	// return &iterator{
-	//     fw:  fwIter,
-	//     log: db.log,
-	// }
-	return newErrorIterator(ErrIteratorNotImplemented)
+	if db.closed.Load() {
+		return newErrorIterator(ErrClosed)
+	}
+
+	db.pendingMu.Lock()
+	defer db.pendingMu.Unlock()
+
+	// Get latest revision from Firewood
+	rev, err := db.fw.LatestRevision()
+	if err != nil {
+		return newErrorIterator(fmt.Errorf("failed to get latest revision: %w", err))
+	}
+
+	// Create FFI iterator starting from prefix
+	fwIter, err := rev.Iter(prefix)
+	if err != nil {
+		return newErrorIterator(fmt.Errorf("failed to create iterator: %w", err))
+	}
+
+	// Prepare pending operations (filtered by prefix)
+	pending := db.preparePendingOpsLocked(nil, prefix)
+
+	return newIterator(fwIter, pending, db.log)
 }
 
 // NewIteratorWithStartAndPrefix implements database.Iteratee
 func (db *Database) NewIteratorWithStartAndPrefix(start, prefix []byte) database.Iterator {
-	// TODO: Implement once fork has iterator support
-	// Could be implemented as:
-	// 1. NewIteratorPrefix(prefix)
-	// 2. Seek to start
-	// 3. Validate key still has prefix
-	return newErrorIterator(ErrIteratorNotImplemented)
+	if db.closed.Load() {
+		return newErrorIterator(ErrClosed)
+	}
+
+	db.pendingMu.Lock()
+	defer db.pendingMu.Unlock()
+
+	// Get latest revision from Firewood
+	rev, err := db.fw.LatestRevision()
+	if err != nil {
+		return newErrorIterator(fmt.Errorf("failed to get latest revision: %w", err))
+	}
+
+	// Create FFI iterator starting from start key
+	// Note: Firewood iterator doesn't have native prefix+start support,
+	// so we filter in the merge iterator
+	fwIter, err := rev.Iter(start)
+	if err != nil {
+		return newErrorIterator(fmt.Errorf("failed to create iterator: %w", err))
+	}
+
+	// Prepare pending operations (filtered by both start and prefix)
+	pending := db.preparePendingOpsLocked(start, prefix)
+
+	return newIterator(fwIter, pending, db.log)
 }
 
 // Compact implements database.Compacter
@@ -196,128 +447,162 @@ func (db *Database) Compact(start []byte, limit []byte) error {
 }
 
 // Close implements io.Closer
+// Flushes pending writes and closes the underlying Firewood database.
 func (db *Database) Close() error {
-	// TODO: Implement cleanup
-	// if !db.closed.CompareAndSwap(false, true) {
-	//     return ErrClosed
-	// }
-	// return db.fw.Close()
+	if !db.closed.CompareAndSwap(false, true) {
+		return ErrClosed
+	}
+
+	db.pendingMu.Lock()
+	defer db.pendingMu.Unlock()
+
+	// Flush any pending writes if configured to do so
+	if db.flushOnClose && len(db.pending.ops) > 0 {
+		db.log.Info("Flushing pending writes before close",
+			"operations", len(db.pending.ops),
+		)
+		if err := db.flushLocked(); err != nil {
+			db.log.Error("Failed to flush pending writes on close", "error", err)
+			// Continue with close despite flush error
+		}
+	}
+
+	// Close Firewood database
+	if err := db.fw.Close(); err != nil {
+		return fmt.Errorf("failed to close firewood database: %w", err)
+	}
+
+	db.log.Info("Firewood database closed")
 	return nil
 }
 
 // HealthCheck implements health.Checker
 func (db *Database) HealthCheck(ctx context.Context) (interface{}, error) {
-	// TODO: Implement health check
-	// Basic check: verify database is not closed and can perform a read
-	// if db.closed.Load() {
-	//     return nil, ErrClosed
-	// }
-	//
-	// // Try a simple operation to verify database is responsive
-	// _, err := db.Has([]byte("health-check"))
-	// if err != nil {
-	//     return nil, fmt.Errorf("health check failed: %w", err)
-	// }
-	//
-	// return map[string]interface{}{
-	//     "database": "firewood",
-	//     "status":   "healthy",
-	// }, nil
+	if db.closed.Load() {
+		return nil, ErrClosed
+	}
 
-	return nil, ErrIteratorNotImplemented
+	db.pendingMu.Lock()
+	pendingOps := len(db.pending.ops)
+	db.pendingMu.Unlock()
+
+	// Try a simple read operation to verify database is responsive
+	testKey := []byte("__health_check__")
+	_, err := db.fw.Get(testKey)
+	if err != nil && !errors.Is(err, ffi.ErrKeyNotFound) {
+		return nil, fmt.Errorf("health check failed: %w", err)
+	}
+
+	return map[string]interface{}{
+		"database":       "firewood",
+		"status":         "healthy",
+		"pendingOps":     pendingOps,
+		"flushThreshold": db.flushSize,
+	}, nil
 }
 
 // batch implements database.Batch for Firewood
+// Operations are buffered in memory and committed atomically on Write().
 type batch struct {
 	db  *Database
-	ops []database.BatchOp
+	ops map[string]*pendingOp
 }
 
 func (b *batch) Put(key []byte, value []byte) error {
-	// TODO: Buffer operation
-	// b.ops = append(b.ops, database.BatchOp{
-	//     Key:    append([]byte(nil), key...),
-	//     Value:  append([]byte(nil), value...),
-	//     Delete: false,
-	// })
-	// return nil
-	return ErrIteratorNotImplemented
+	// Make copies to prevent caller from modifying our internal state
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+	valueCopy := make([]byte, len(value))
+	copy(valueCopy, value)
+
+	b.ops[string(keyCopy)] = &pendingOp{
+		key:    keyCopy,
+		value:  valueCopy,
+		delete: false,
+	}
+	return nil
 }
 
 func (b *batch) Delete(key []byte) error {
-	// TODO: Buffer operation
-	// b.ops = append(b.ops, database.BatchOp{
-	//     Key:    append([]byte(nil), key...),
-	//     Delete: true,
-	// })
-	// return nil
-	return ErrIteratorNotImplemented
+	// Make copy to prevent caller from modifying our internal state
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+
+	b.ops[string(keyCopy)] = &pendingOp{
+		key:    keyCopy,
+		value:  nil,
+		delete: true,
+	}
+	return nil
 }
 
 func (b *batch) ValueSize() int {
-	// TODO: Calculate total size of buffered operations
-	// total := 0
-	// for _, op := range b.ops {
-	//     total += len(op.Key) + len(op.Value)
-	// }
-	// return total
-	return 0
+	total := 0
+	for _, op := range b.ops {
+		total += len(op.key) + len(op.value)
+	}
+	return total
 }
 
 func (b *batch) Write() error {
-	// TODO: Execute all buffered operations atomically
-	// for _, op := range b.ops {
-	//     if op.Delete {
-	//         if err := b.db.Delete(op.Key); err != nil {
-	//             return err
-	//         }
-	//     } else {
-	//         if err := b.db.Put(op.Key, op.Value); err != nil {
-	//             return err
-	//         }
-	//     }
-	// }
-	// return nil
-	return ErrIteratorNotImplemented
+	if b.db.closed.Load() {
+		return ErrClosed
+	}
+
+	if len(b.ops) == 0 {
+		return nil
+	}
+
+	// Collect keys and values for proposal
+	keys := make([][]byte, 0, len(b.ops))
+	values := make([][]byte, 0, len(b.ops))
+
+	for _, op := range b.ops {
+		keys = append(keys, op.key)
+		if op.delete {
+			values = append(values, nil) // nil value = delete
+		} else {
+			values = append(values, op.value)
+		}
+	}
+
+	// Create proposal
+	proposal, err := b.db.fw.Propose(keys, values)
+	if err != nil {
+		return fmt.Errorf("firewood batch propose failed: %w", err)
+	}
+
+	// Commit proposal atomically
+	if err := proposal.Commit(); err != nil {
+		return fmt.Errorf("firewood batch commit failed: %w", err)
+	}
+
+	b.db.log.Debug("Batch write committed",
+		"operations", len(keys),
+	)
+
+	return nil
 }
 
 func (b *batch) Reset() {
-	// TODO: Clear buffered operations
-	// b.ops = b.ops[:0]
+	b.ops = make(map[string]*pendingOp)
 }
 
 func (b *batch) Replay(w database.KeyValueWriterDeleter) error {
-	// TODO: Replay operations to another database
-	// for _, op := range b.ops {
-	//     if op.Delete {
-	//         if err := w.Delete(op.Key); err != nil {
-	//             return err
-	//         }
-	//     } else {
-	//         if err := w.Put(op.Key, op.Value); err != nil {
-	//             return err
-	//         }
-	//     }
-	// }
-	// return nil
-	return ErrIteratorNotImplemented
+	for _, op := range b.ops {
+		if op.delete {
+			if err := w.Delete(op.key); err != nil {
+				return err
+			}
+		} else {
+			if err := w.Put(op.key, op.value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (b *batch) Inner() database.Batch {
 	return b
 }
-
-// errorIterator is a placeholder iterator that returns an error
-type errorIterator struct {
-	err error
-}
-
-func newErrorIterator(err error) database.Iterator {
-	return &errorIterator{err: err}
-}
-
-func (it *errorIterator) Next() bool { return false }
-func (it *errorIterator) Error() error { return it.err }
-func (it *errorIterator) Key() []byte { return nil }
-func (it *errorIterator) Value() []byte { return nil }
-func (it *errorIterator) Release() {}

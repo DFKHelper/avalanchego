@@ -3,6 +3,10 @@
 
 package firewood
 
+import (
+	"github.com/ava-labs/firewood-go-ethhash/ffi"
+)
+
 const (
 	// DefaultCacheSizeBytes is the default size for Firewood's cache
 	// Merkle trie databases benefit from caching frequently accessed nodes
@@ -15,10 +19,6 @@ const (
 	// DefaultRevisionsInMemory is the default number of historical revisions to keep
 	// Firewood supports versioned storage - this controls memory vs disk trade-off
 	DefaultRevisionsInMemory = 10
-
-	// DefaultCacheStrategy is the default caching strategy
-	// Options: "lru" (least recently used), "lfu" (least frequently used)
-	DefaultCacheStrategy = "lru"
 )
 
 // Config defines configuration options for Firewood database
@@ -47,10 +47,15 @@ type Config struct {
 	RevisionsInMemory uint `json:"revisionsInMemory"`
 
 	// CacheStrategy determines eviction policy for the node cache
-	// Options:
-	//   - "lru": Least Recently Used (default, good for general workloads)
-	//   - "lfu": Least Frequently Used (better for hot data)
-	CacheStrategy string `json:"cacheStrategy"`
+	// Uses FFI CacheStrategy type from firewood-go-ethhash
+	CacheStrategy ffi.CacheStrategy `json:"cacheStrategy"`
+
+	// FlushSize controls auto-flush threshold for pending writes
+	// When pending operations reach this count, they are automatically committed
+	// Higher values = better batch efficiency but more memory
+	// Lower values = lower memory but more frequent commits
+	// Recommended: 1000 for most use cases
+	FlushSize int `json:"flushSize"`
 }
 
 // DefaultConfig returns the default Firewood configuration
@@ -59,17 +64,7 @@ func DefaultConfig() Config {
 		CacheSizeBytes:       DefaultCacheSizeBytes,
 		FreeListCacheEntries: DefaultFreeListCacheEntries,
 		RevisionsInMemory:    DefaultRevisionsInMemory,
-		CacheStrategy:        DefaultCacheStrategy,
+		CacheStrategy:        ffi.CacheAllReads, // Default: cache all reads
+		FlushSize:            DefaultFlushSize,
 	}
 }
-
-// toFFIConfig converts Go config to FFI-compatible config struct
-// TODO: Implement once fork is ready with FFI types
-// func (c Config) toFFIConfig() *ffi.DatabaseConfig {
-//     return &ffi.DatabaseConfig{
-//         CacheSizeBytes:       c.CacheSizeBytes,
-//         FreeListCacheEntries: c.FreeListCacheEntries,
-//         RevisionsInMemory:    c.RevisionsInMemory,
-//         CacheStrategy:        c.CacheStrategy,
-//     }
-// }
