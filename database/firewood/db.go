@@ -104,11 +104,7 @@ func New(file string, configBytes []byte, log logging.Logger) (database.Database
 		return nil, fmt.Errorf("failed to open firewood database: %w", err)
 	}
 
-	log.Info("Firewood database opened successfully",
-		"path", file,
-		"cacheSize", cfg.CacheSizeBytes,
-		"revisions", cfg.RevisionsInMemory,
-	)
+	log.Info("Firewood database opened successfully")
 
 	flushSize := cfg.FlushSize
 	if flushSize == 0 {
@@ -158,9 +154,7 @@ func (db *Database) flushLocked() error {
 	// Clear pending batch
 	db.pending = newPendingBatch()
 
-	db.log.Debug("Flushed pending batch",
-		"operations", len(keys),
-	)
+	db.log.Debug("Flushed pending batch")
 
 	return nil
 }
@@ -180,15 +174,13 @@ func (db *Database) Has(key []byte) (bool, error) {
 	}
 
 	// Check committed state in Firewood
-	_, err := db.fw.Get(key)
+	val, err := db.fw.Get(key)
 	if err != nil {
-		if errors.Is(err, ffi.ErrKeyNotFound) {
-			return false, nil
-		}
 		return false, err
 	}
 
-	return true, nil
+	// Firewood Get() returns nil for missing keys (not an error)
+	return val != nil, nil
 }
 
 // Get implements database.KeyValueReader
@@ -215,10 +207,12 @@ func (db *Database) Get(key []byte) ([]byte, error) {
 	// Check committed state in Firewood
 	value, err := db.fw.Get(key)
 	if err != nil {
-		if errors.Is(err, ffi.ErrKeyNotFound) {
-			return nil, database.ErrNotFound
-		}
 		return nil, err
+	}
+
+	// Firewood Get() returns nil for missing keys (not an error)
+	if value == nil {
+		return nil, database.ErrNotFound
 	}
 
 	return value, nil
@@ -458,17 +452,16 @@ func (db *Database) Close() error {
 
 	// Flush any pending writes if configured to do so
 	if db.flushOnClose && len(db.pending.ops) > 0 {
-		db.log.Info("Flushing pending writes before close",
-			"operations", len(db.pending.ops),
-		)
+		db.log.Info("Flushing pending writes before close")
 		if err := db.flushLocked(); err != nil {
-			db.log.Error("Failed to flush pending writes on close", "error", err)
+			db.log.Error("Failed to flush pending writes on close")
 			// Continue with close despite flush error
 		}
 	}
 
 	// Close Firewood database
-	if err := db.fw.Close(); err != nil {
+	ctx := context.Background()
+	if err := db.fw.Close(ctx); err != nil {
 		return fmt.Errorf("failed to close firewood database: %w", err)
 	}
 
@@ -489,7 +482,7 @@ func (db *Database) HealthCheck(ctx context.Context) (interface{}, error) {
 	// Try a simple read operation to verify database is responsive
 	testKey := []byte("__health_check__")
 	_, err := db.fw.Get(testKey)
-	if err != nil && !errors.Is(err, ffi.ErrKeyNotFound) {
+	if err != nil {
 		return nil, fmt.Errorf("health check failed: %w", err)
 	}
 
@@ -536,7 +529,7 @@ func (b *batch) Delete(key []byte) error {
 	return nil
 }
 
-func (b *batch) ValueSize() int {
+func (b *batch) Size() int {
 	total := 0
 	for _, op := range b.ops {
 		total += len(op.key) + len(op.value)
@@ -577,9 +570,7 @@ func (b *batch) Write() error {
 		return fmt.Errorf("firewood batch commit failed: %w", err)
 	}
 
-	b.db.log.Debug("Batch write committed",
-		"operations", len(keys),
-	)
+	b.db.log.Debug("Batch write committed")
 
 	return nil
 }
