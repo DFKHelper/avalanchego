@@ -392,9 +392,13 @@ func (vm *VM) Shutdown(context.Context) error {
 		return nil
 	}
 
-	vm.onShutdownCtxCancel()
+	// Nil check to prevent panic if initialization failed before onShutdownCtxCancel was set
+	if vm.onShutdownCtxCancel != nil {
+		vm.onShutdownCtxCancel()
+	}
 
-	if vm.uptimeManager.StartedTracking() {
+	// Nil check to prevent panic if initialization failed before uptimeManager was set
+	if vm.uptimeManager != nil && vm.Validators != nil && vm.uptimeManager.StartedTracking() {
 		primaryVdrIDs := vm.Validators.GetValidatorIDs(constants.PrimaryNetworkID)
 		if err := vm.uptimeManager.StopTracking(primaryVdrIDs); err != nil {
 			return err
@@ -405,10 +409,14 @@ func (vm *VM) Shutdown(context.Context) error {
 		}
 	}
 
-	return errors.Join(
-		vm.state.Close(),
-		vm.db.Close(),
-	)
+	var errs []error
+	if vm.state != nil {
+		errs = append(errs, vm.state.Close())
+	}
+	if vm.db != nil {
+		errs = append(errs, vm.db.Close())
+	}
+	return errors.Join(errs...)
 }
 
 func (vm *VM) ParseBlock(_ context.Context, b []byte) (snowman.Block, error) {
