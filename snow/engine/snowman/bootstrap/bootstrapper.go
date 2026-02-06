@@ -1029,7 +1029,18 @@ func (b *Bootstrapper) tryStartExecuting(ctx context.Context) error {
 	// If there is an additional callback, notify them that this chain has been
 	// synced.
 	if b.Bootstrapped != nil {
-		b.bootstrappedOnce.Do(b.Bootstrapped)
+		// Recover from panics in Bootstrapped callback (e.g., DFK chain initialization)
+		// to avoid cascading failures
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					b.Ctx.Log.Error("PANIC in Bootstrapped callback - DFK chain initialization failed",
+						zap.Any("panic", r),
+					)
+				}
+			}()
+			b.bootstrappedOnce.Do(b.Bootstrapped)
+		}()
 	}
 
 	// Notify the subnet that this chain is synced
