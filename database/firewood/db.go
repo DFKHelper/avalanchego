@@ -12,6 +12,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/utils/logging"
@@ -34,6 +35,7 @@ const (
 // - database.Database expects immediate Put/Get operations
 // - Adapter accumulates writes in pending batch
 // - Auto-flushes when batch reaches threshold (default: 1000 ops)
+// - ALSO flushes on periodic timer (default: 5 seconds) to prevent data loss on crash
 // - Provides read-your-writes consistency by checking pending batch first
 //
 // See ARCHITECTURE_NOTES.md for detailed design rationale.
@@ -47,6 +49,10 @@ type Database struct {
 	pending      *pendingBatch // Accumulates writes until flush
 	flushSize    int           // Auto-flush threshold
 	flushOnClose bool          // Whether to flush pending writes on close
+
+	// Periodic flush to prevent data loss on crash
+	flushTicker *time.Ticker
+	flushDone   chan struct{}
 }
 
 // pendingBatch tracks writes that haven't been committed to Firewood yet
@@ -121,13 +127,20 @@ func New(file string, configBytes []byte, log logging.Logger) (database.Database
 		flushSize = DefaultFlushSize
 	}
 
-	return &Database{
+	db := &Database{
 		fw:           fw,
 		log:          log,
 		pending:      newPendingBatch(),
 		flushSize:    flushSize,
 		flushOnClose: true,
-	}, nil
+		flushTicker:  time.NewTicker(5 * time.Second), // Flush every 5 seconds
+		flushDone:    make(chan struct{}),
+	}
+
+	// Start periodic flush goroutine to prevent data loss on crash
+	go db.periodicFlush()
+
+	return db, nil
 }
 
 // flushLocked commits pending writes to Firewood.
@@ -499,6 +512,10 @@ func (db *Database) Close() error {
 		}
 	}
 
+	// Stop periodic flush goroutine
+	db.flushTicker.Stop()
+	close(db.flushDone)
+
 	// Close Firewood database
 	ctx := context.Background()
 	if err := db.fw.Close(ctx); err != nil {
@@ -507,6 +524,36 @@ func (db *Database) Close() error {
 
 	db.log.Info("Firewood database closed")
 	return nil
+}
+
+// periodicFlush runs in a background goroutine and flushes pending writes periodically
+// This prevents data loss if the process crashes before the batch size threshold is reached
+func (db *Database) periodicFlush() {
+	for {
+		select {
+		case <-db.flushTicker.C:
+			db.pendingMu.Lock()
+			if len(db.pending.ops) > 0 {
+				if err := db.flushLocked(); err != nil {
+					if db.log != nil {
+						db.log.Error("Periodic flush failed",
+							zap.Int("pendingOps", len(db.pending.ops)),
+							zap.Error(err),
+						)
+					}
+				} else if db.log != nil {
+					db.log.Debug("Periodic flush committed pending writes",
+						zap.Int("opsCount", len(db.pending.ops)),
+					)
+				}
+			}
+			db.pendingMu.Unlock()
+
+		case <-db.flushDone:
+			// Graceful shutdown
+			return
+		}
+	}
 }
 
 // HealthCheck implements health.Checker
