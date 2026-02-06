@@ -850,9 +850,13 @@ func (vm *VM) Shutdown(context.Context) error {
 	if vm.cancel != nil {
 		vm.cancel()
 	}
-	vm.Network.Shutdown()
-	if err := vm.Client.Shutdown(); err != nil {
-		log.Error("error stopping state syncer", "err", err)
+	if vm.Network != nil {
+		vm.Network.Shutdown()
+	}
+	if vm.Client != nil {
+		if err := vm.Client.Shutdown(); err != nil {
+			log.Error("error stopping state syncer", "err", err)
+		}
 	}
 	close(vm.shutdownChan)
 	// Stop RPC handlers before eth.Stop which will close the database
