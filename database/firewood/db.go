@@ -6,6 +6,7 @@ package firewood
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -15,6 +16,7 @@ import (
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/firewood-go-ethhash/ffi"
+	"go.uber.org/zap"
 )
 
 const (
@@ -76,8 +78,22 @@ func New(file string, configBytes []byte, log logging.Logger) (database.Database
 	// Parse configuration
 	var cfg Config
 	if len(configBytes) > 0 {
-		if err := json.Unmarshal(configBytes, &cfg); err != nil {
-			return nil, fmt.Errorf("failed to parse firewood config: %w", err)
+		// The configBytes contains the full db-config.json structure like:
+		// {"leveldb": {...}, "firewood": {...}, "pruning": {...}}
+		// We need to extract just the "firewood" section
+		var fullConfig map[string]json.RawMessage
+		if err := json.Unmarshal(configBytes, &fullConfig); err != nil {
+			return nil, fmt.Errorf("failed to parse database config: %w", err)
+		}
+
+		// Extract the "firewood" section if it exists
+		if firewoodSection, exists := fullConfig["firewood"]; exists {
+			if err := json.Unmarshal(firewoodSection, &cfg); err != nil {
+				return nil, fmt.Errorf("failed to parse firewood config section: %w", err)
+			}
+		} else {
+			// No firewood section, use defaults
+			cfg = DefaultConfig()
 		}
 	} else {
 		// Use default config if none provided
@@ -207,6 +223,36 @@ func (db *Database) Get(key []byte) ([]byte, error) {
 	// Firewood Get() returns nil for missing keys (not an error)
 	if value == nil {
 		return nil, database.ErrNotFound
+	}
+
+	// DEBUG: Log what Firewood returns before transformation
+	if db.log != nil {
+		valueLen := len(value)
+		hexPreview := hex.EncodeToString(value[:min(valueLen, 32)])
+		asciiCheck := isASCII(value[:min(valueLen, 32)])
+		db.log.Debug("Firewood Get() raw data",
+			zap.String("keyHex", hex.EncodeToString(key)),
+			zap.Int("valueLen", valueLen),
+			zap.String("valueHexPreview", hexPreview),
+			zap.Bool("looksASCII", asciiCheck),
+		)
+	}
+
+	// Try to decode hex-encoded data from Firewood
+	if decoded, ok := tryHexDecode(value); ok {
+		// DEBUG: Log successful hex decode
+		if db.log != nil {
+			db.log.Debug("Firewood Get() hex decode SUCCESS",
+				zap.Int("originalLen", len(value)),
+				zap.Int("decodedLen", len(decoded)),
+			)
+		}
+		return decoded, nil
+	}
+
+	// DEBUG: Log that we're returning raw data
+	if db.log != nil {
+		db.log.Debug("Firewood Get() returning raw (not hex)")
 	}
 
 	return value, nil
