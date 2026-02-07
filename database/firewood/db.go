@@ -38,6 +38,11 @@ const (
 // - ALSO flushes on periodic timer (default: 5 seconds) to prevent data loss on crash
 // - Provides read-your-writes consistency by checking pending batch first
 //
+// Key Registry: Tracks all committed keys in memory (not using Firewood's merkle iterator)
+// - Firewood's iterator returns merkle nodes, not key-value pairs
+// - Instead, we maintain a registry of all keys committed to Firewood
+// - Iterator uses this registry to fetch actual key-value pairs
+//
 // See ARCHITECTURE_NOTES.md for detailed design rationale.
 type Database struct {
 	fw     *ffi.Database
@@ -53,6 +58,12 @@ type Database struct {
 	// Periodic flush to prevent data loss on crash
 	flushTicker *time.Ticker
 	flushDone   chan struct{}
+
+	// Key registry: Track all committed keys to enable iteration without Firewood's merkle iterator
+	// Firewood's rev.Iter() returns merkle nodes (97-129 bytes), not actual keys
+	// This registry lets us iterate over actual committed keys
+	registryMu sync.RWMutex
+	registry   map[string]bool // Set of all committed keys (string key, bool always true)
 }
 
 // pendingBatch tracks writes that haven't been committed to Firewood yet
@@ -135,6 +146,7 @@ func New(file string, configBytes []byte, log logging.Logger) (database.Database
 		flushOnClose: true,
 		flushTicker:  time.NewTicker(5 * time.Second), // Flush every 5 seconds
 		flushDone:    make(chan struct{}),
+		registry:     make(map[string]bool),            // Initialize key registry
 	}
 
 	// Start periodic flush goroutine to prevent data loss on crash
@@ -174,10 +186,24 @@ func (db *Database) flushLocked() error {
 		return fmt.Errorf("firewood commit failed: %w", err)
 	}
 
+	// Update key registry with committed keys
+	// This enables iteration without relying on Firewood's merkle iterator
+	db.registryMu.Lock()
+	for _, op := range db.pending.ops {
+		if op.delete {
+			delete(db.registry, string(op.key))
+		} else {
+			db.registry[string(op.key)] = true
+		}
+	}
+	db.registryMu.Unlock()
+
 	// Clear pending batch
 	db.pending = newPendingBatch()
 
-	db.log.Debug("Flushed pending batch")
+	db.log.Debug("Flushed pending batch",
+		zap.Int("registrySize", len(db.registry)),
+	)
 
 	return nil
 }
@@ -375,7 +401,7 @@ func (db *Database) preparePendingOpsLocked(start, prefix []byte) []pendingKV {
 }
 
 // NewIterator implements database.Iteratee
-// Returns merge iterator combining committed state + pending writes
+// Returns registry-based iterator combining committed + pending operations
 func (db *Database) NewIterator() database.Iterator {
 	if db.closed.Load() {
 		return newErrorIterator(database.ErrClosed)
@@ -384,22 +410,11 @@ func (db *Database) NewIterator() database.Iterator {
 	db.pendingMu.Lock()
 	defer db.pendingMu.Unlock()
 
-	// Get latest revision from Firewood
-	rev, err := db.fw.LatestRevision()
-	if err != nil {
-		return newErrorIterator(fmt.Errorf("failed to get latest revision: %w", err))
-	}
-
-	// Create FFI iterator starting from beginning (empty slice)
-	fwIter, err := rev.Iter([]byte{})
-	if err != nil {
-		return newErrorIterator(fmt.Errorf("failed to create iterator: %w", err))
-	}
-
 	// Prepare pending operations
 	pending := db.preparePendingOpsLocked(nil, nil)
 
-	return newIterator(fwIter, pending, db.log)
+	// Create registry-based iterator (no Firewood FFI iterator needed)
+	return newIterator(db, pending, nil, nil, db.log)
 }
 
 // NewIteratorWithStart implements database.Iteratee
@@ -411,22 +426,11 @@ func (db *Database) NewIteratorWithStart(start []byte) database.Iterator {
 	db.pendingMu.Lock()
 	defer db.pendingMu.Unlock()
 
-	// Get latest revision from Firewood
-	rev, err := db.fw.LatestRevision()
-	if err != nil {
-		return newErrorIterator(fmt.Errorf("failed to get latest revision: %w", err))
-	}
-
-	// Create FFI iterator starting from start key
-	fwIter, err := rev.Iter(start)
-	if err != nil {
-		return newErrorIterator(fmt.Errorf("failed to create iterator: %w", err))
-	}
-
 	// Prepare pending operations (filtered by start)
 	pending := db.preparePendingOpsLocked(start, nil)
 
-	return newIterator(fwIter, pending, db.log)
+	// Create registry-based iterator with start filter
+	return newIterator(db, pending, start, nil, db.log)
 }
 
 // NewIteratorWithPrefix implements database.Iteratee
@@ -438,22 +442,11 @@ func (db *Database) NewIteratorWithPrefix(prefix []byte) database.Iterator {
 	db.pendingMu.Lock()
 	defer db.pendingMu.Unlock()
 
-	// Get latest revision from Firewood
-	rev, err := db.fw.LatestRevision()
-	if err != nil {
-		return newErrorIterator(fmt.Errorf("failed to get latest revision: %w", err))
-	}
-
-	// Create FFI iterator starting from prefix
-	fwIter, err := rev.Iter(prefix)
-	if err != nil {
-		return newErrorIterator(fmt.Errorf("failed to create iterator: %w", err))
-	}
-
 	// Prepare pending operations (filtered by prefix)
 	pending := db.preparePendingOpsLocked(nil, prefix)
 
-	return newIterator(fwIter, pending, db.log)
+	// Create registry-based iterator with prefix filter
+	return newIterator(db, pending, nil, prefix, db.log)
 }
 
 // NewIteratorWithStartAndPrefix implements database.Iteratee
@@ -465,24 +458,11 @@ func (db *Database) NewIteratorWithStartAndPrefix(start, prefix []byte) database
 	db.pendingMu.Lock()
 	defer db.pendingMu.Unlock()
 
-	// Get latest revision from Firewood
-	rev, err := db.fw.LatestRevision()
-	if err != nil {
-		return newErrorIterator(fmt.Errorf("failed to get latest revision: %w", err))
-	}
-
-	// Create FFI iterator starting from start key
-	// Note: Firewood iterator doesn't have native prefix+start support,
-	// so we filter in the merge iterator
-	fwIter, err := rev.Iter(start)
-	if err != nil {
-		return newErrorIterator(fmt.Errorf("failed to create iterator: %w", err))
-	}
-
 	// Prepare pending operations (filtered by both start and prefix)
 	pending := db.preparePendingOpsLocked(start, prefix)
 
-	return newIterator(fwIter, pending, db.log)
+	// Create registry-based iterator with both start and prefix filters
+	return newIterator(db, pending, start, prefix, db.log)
 }
 
 // Compact implements database.Compacter
