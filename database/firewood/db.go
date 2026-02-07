@@ -4,9 +4,11 @@
 package firewood
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
