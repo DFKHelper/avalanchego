@@ -863,8 +863,10 @@ func (vm *VM) Shutdown(context.Context) error {
 	for _, handler := range vm.rpcHandlers {
 		handler.Stop()
 	}
-	if err := vm.eth.Stop(); err != nil {
-		log.Error("error stopping eth", "err", err)
+	if vm.eth != nil {
+		if err := vm.eth.Stop(); err != nil {
+			log.Error("error stopping eth", "err", err)
+		}
 	}
 	vm.shutdownWg.Wait()
 	return nil
