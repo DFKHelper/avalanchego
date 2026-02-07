@@ -4,12 +4,9 @@
 package firewood
 
 import (
-	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -264,37 +261,10 @@ func (db *Database) Get(key []byte) ([]byte, error) {
 		return nil, database.ErrNotFound
 	}
 
-	// DEBUG: Log what Firewood returns before transformation
-	if db.log != nil {
-		valueLen := len(value)
-		hexPreview := hex.EncodeToString(value[:min(valueLen, 32)])
-		asciiCheck := isASCII(value[:min(valueLen, 32)])
-		db.log.Debug("Firewood Get() raw data",
-			zap.String("keyHex", hex.EncodeToString(key)),
-			zap.Int("valueLen", valueLen),
-			zap.String("valueHexPreview", hexPreview),
-			zap.Bool("looksASCII", asciiCheck),
-		)
-	}
-
-	// Try to decode hex-encoded data from Firewood
-	if decoded, ok := tryHexDecode(value); ok {
-		// DEBUG: Log successful hex decode
-		if db.log != nil {
-			db.log.Debug("Firewood Get() hex decode SUCCESS",
-				zap.Int("originalLen", len(value)),
-				zap.Int("decodedLen", len(decoded)),
-			)
-		}
-		return decoded, nil
-	}
-
-	// DEBUG: Log that we're returning raw data
-	if db.log != nil {
-		db.log.Debug("Firewood Get() returning raw (not hex)")
-	}
-
-	return value, nil
+	// Return copy to prevent caller from modifying Firewood's internal state
+	result := make([]byte, len(value))
+	copy(result, value)
+	return result, nil
 }
 
 // Put implements database.KeyValueWriter
