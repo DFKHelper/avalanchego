@@ -620,7 +620,18 @@ func (b *batch) Write() error {
 		return fmt.Errorf("firewood batch commit failed: %w", err)
 	}
 
-	b.db.log.Debug("Batch write committed")
+	// Update key registry with committed keys (CRITICAL: blocks won't be iterable without this)
+	b.db.registryMu.Lock()
+	for _, op := range b.ops {
+		if op.delete {
+			delete(b.db.registry, string(op.key))
+		} else {
+			b.db.registry[string(op.key)] = true
+		}
+	}
+	b.db.registryMu.Unlock()
+
+	b.db.log.Debug("Batch write committed", zap.Int("keysWritten", len(b.ops)))
 
 	return nil
 }
