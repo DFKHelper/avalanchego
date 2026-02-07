@@ -143,7 +143,7 @@ func New(file string, configBytes []byte, log logging.Logger) (database.Database
 		flushOnClose: true,
 		flushTicker:  time.NewTicker(5 * time.Second), // Flush every 5 seconds
 		flushDone:    make(chan struct{}),
-		registry:     make(map[string]bool),            // Initialize key registry
+		registry:     make(map[string]bool), // Initialize key registry
 	}
 
 	// Start periodic flush goroutine to prevent data loss on crash
