@@ -10,6 +10,7 @@ import (
 
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/utils/logging"
+	"go.uber.org/zap"
 )
 
 // MigrationConfig defines configuration for database migration
@@ -99,8 +100,8 @@ func MigrateDatabase(
 	}
 
 	log.Info("starting database migration",
-		"batchSize", config.BatchSize,
-		"verify", config.VerifyAfterMigration,
+		zap.Int("batchSize", config.BatchSize),
+		zap.Bool("verify", config.VerifyAfterMigration),
 	)
 
 	// Create iterator over source database
@@ -114,7 +115,7 @@ func MigrateDatabase(
 	// Progress reporting ticker
 	var progressTicker *time.Ticker
 	if config.ProgressInterval > 0 {
-		progressTicker = time.Ticker(config.ProgressInterval)
+		progressTicker = time.NewTicker(config.ProgressInterval)
 		defer progressTicker.Stop()
 	}
 
@@ -138,8 +139,8 @@ func MigrateDatabase(
 				return stats, fmt.Errorf("failed to add key to batch: %w", err)
 			}
 			log.Warn("failed to add key to batch, continuing",
-				"error", err,
-				"keySize", len(key),
+				zap.Error(err),
+				zap.Int("keySize", len(key)),
 			)
 			continue
 		}
@@ -156,7 +157,7 @@ func MigrateDatabase(
 				if !config.ContinueOnError {
 					return stats, fmt.Errorf("failed to write batch: %w", err)
 				}
-				log.Warn("failed to write batch, continuing", "error", err)
+				log.Warn("failed to write batch, continuing", zap.Error(err))
 			}
 			batch.Reset()
 			batchCount = 0
@@ -168,12 +169,12 @@ func MigrateDatabase(
 			case <-progressTicker.C:
 				elapsed := time.Since(stats.StartTime)
 				log.Info("migration progress",
-					"keys", stats.TotalKeys,
-					"bytes", stats.TotalBytes,
-					"keysPerSec", stats.KeysPerSecond(),
-					"mbPerSec", stats.BytesPerSecond()/(1024*1024),
-					"elapsed", elapsed.Round(time.Second),
-					"errors", stats.ErrorCount,
+					zap.Uint64("keys", stats.TotalKeys),
+					zap.Uint64("bytes", stats.TotalBytes),
+					zap.Float64("keysPerSec", stats.KeysPerSecond()),
+					zap.Float64("mbPerSec", stats.BytesPerSecond()/(1024*1024)),
+					zap.Duration("elapsed", elapsed.Round(time.Second)),
+					zap.Uint64("errors", stats.ErrorCount),
 				)
 				stats.LastUpdateTime = time.Now()
 			default:
@@ -196,12 +197,12 @@ func MigrateDatabase(
 	stats.EndTime = time.Now()
 
 	log.Info("migration completed",
-		"totalKeys", stats.TotalKeys,
-		"totalBytes", stats.TotalBytes,
-		"duration", stats.EndTime.Sub(stats.StartTime).Round(time.Second),
-		"keysPerSec", stats.KeysPerSecond(),
-		"mbPerSec", stats.BytesPerSecond()/(1024*1024),
-		"errors", stats.ErrorCount,
+		zap.Uint64("totalKeys", stats.TotalKeys),
+		zap.Uint64("totalBytes", stats.TotalBytes),
+		zap.Duration("duration", stats.EndTime.Sub(stats.StartTime).Round(time.Second)),
+		zap.Float64("keysPerSec", stats.KeysPerSecond()),
+		zap.Float64("mbPerSec", stats.BytesPerSecond()/(1024*1024)),
+		zap.Uint64("errors", stats.ErrorCount),
 	)
 
 	// Optional verification
@@ -247,7 +248,7 @@ func verifyMigration(
 		if !has {
 			errors++
 			log.Error("key missing in destination",
-				"keySize", len(key),
+				zap.Int("keySize", len(key)),
 			)
 			continue
 		}
@@ -261,16 +262,16 @@ func verifyMigration(
 		if !bytesEqual(sourceValue, destValue) {
 			errors++
 			log.Error("value mismatch",
-				"keySize", len(key),
-				"sourceValueSize", len(sourceValue),
-				"destValueSize", len(destValue),
+				zap.Int("keySize", len(key)),
+				zap.Int("sourceValueSize", len(sourceValue)),
+				zap.Int("destValueSize", len(destValue)),
 			)
 			continue
 		}
 
 		verified++
 		if verified%100000 == 0 {
-			log.Info("verification progress", "verified", verified)
+			log.Info("verification progress", zap.Uint64("verified", verified))
 		}
 	}
 
@@ -282,7 +283,7 @@ func verifyMigration(
 		return fmt.Errorf("verification failed: %d errors found", errors)
 	}
 
-	log.Info("verification complete", "verified", verified)
+	log.Info("verification complete", zap.Uint64("verified", verified))
 	return nil
 }
 
@@ -355,7 +356,7 @@ func EstimateMigrationTime(
 	for iter.Next() {
 		remaining++
 		if remaining%100000 == 0 {
-			log.Info("counting remaining keys", "counted", remaining)
+			log.Info("counting remaining keys", zap.Int("counted", remaining))
 		}
 	}
 
@@ -366,10 +367,10 @@ func EstimateMigrationTime(
 	estimatedDuration = time.Duration(estimatedSeconds * float64(time.Second))
 
 	log.Info("migration estimate",
-		"totalKeys", totalKeys,
-		"totalBytes", estimatedBytes,
-		"estimatedDuration", estimatedDuration.Round(time.Second),
-		"keysPerSec", keysPerSecond,
+		zap.Uint64("totalKeys", totalKeys),
+		zap.Uint64("totalBytes", estimatedBytes),
+		zap.Duration("estimatedDuration", estimatedDuration.Round(time.Second)),
+		zap.Float64("keysPerSec", keysPerSecond),
 	)
 
 	return totalKeys, estimatedBytes, estimatedDuration, nil
