@@ -1,3 +1,6 @@
+//go:build cgo && !windows
+// +build cgo,!windows
+
 // Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
@@ -6,8 +9,11 @@ package firewood
 import (
 	"bytes"
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -61,8 +67,11 @@ type Database struct {
 	// Key registry: Track all committed keys to enable iteration without Firewood's merkle iterator
 	// Firewood's rev.Iter() returns merkle nodes (97-129 bytes), not actual keys
 	// This registry lets us iterate over actual committed keys
-	registryMu sync.RWMutex
-	registry   map[string]bool // Set of all committed keys (string key, bool always true)
+	registryMu        sync.RWMutex
+	registry          map[string]bool // Set of all committed keys (string key, bool always true)
+	registryFile      string          // Path to registry persistence file
+	lastRegistrySave  time.Time       // Last time registry was saved (rate limiting)
+	registrySaveMu    sync.Mutex      // Protects lastRegistrySave
 }
 
 // pendingBatch tracks writes that haven't been committed to Firewood yet
@@ -151,6 +160,15 @@ func New(file string, configBytes []byte, log logging.Logger) (database.Database
 	// Start periodic flush goroutine to prevent data loss on crash
 	go db.periodicFlush()
 
+	// Load registry from disk to preserve bootstrap progress across restarts
+	registryPath := filepath.Join(file, ".registry")
+	if err := db.loadRegistry(registryPath); err != nil {
+		// Registry load failure is non-fatal, but log it
+		log.Warn("Failed to load registry from disk, starting with empty registry",
+			zap.String("path", registryPath),
+			zap.Error(err))
+	}
+
 	return db, nil
 }
 
@@ -197,12 +215,119 @@ func (db *Database) flushLocked() error {
 	}
 	db.registryMu.Unlock()
 
+	// Persist registry to disk (rate-limited to every 5 minutes)
+	if err := db.saveRegistryIfNeeded(); err != nil {
+		db.log.Warn("Failed to save registry to disk", zap.Error(err))
+		// Non-fatal: continue execution, registry will be saved on next flush
+	}
+
 	// Clear pending batch
 	db.pending = newPendingBatch()
 
 	db.log.Debug("Flushed pending batch",
 		zap.Int("registrySize", len(db.registry)),
 	)
+
+	return nil
+}
+
+// saveRegistryLocked persists the registry to disk (gob format).
+// MUST be called with registryMu held (at least read lock).
+// This ensures bootstrap progress is preserved across restarts.
+func (db *Database) saveRegistryLocked() error {
+	if db.registryFile == "" {
+		return nil // Registry persistence disabled
+	}
+
+	// Create temp file in same directory for atomic replace
+	tmpFile := db.registryFile + ".tmp"
+	f, err := os.Create(tmpFile)
+	if err != nil {
+		return fmt.Errorf("failed to create registry file: %w", err)
+	}
+	defer f.Close()
+
+	// Encode registry to gob format
+	encoder := gob.NewEncoder(f)
+	if err := encoder.Encode(db.registry); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("failed to encode registry: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("failed to sync registry file: %w", err)
+	}
+
+	f.Close()
+
+	// Atomic replace: rename temp file to actual file
+	if err := os.Rename(tmpFile, db.registryFile); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("failed to rename registry file: %w", err)
+	}
+
+	return nil
+}
+
+// saveRegistryIfNeeded saves the registry to disk if 5 minutes have passed since last save.
+// This prevents excessive disk I/O while ensuring progress is preserved frequently.
+func (db *Database) saveRegistryIfNeeded() error {
+	db.registrySaveMu.Lock()
+	defer db.registrySaveMu.Unlock()
+
+	// Check if 5 minutes have passed since last save
+	if time.Since(db.lastRegistrySave) < 5*time.Minute {
+		return nil // Too soon, skip save
+	}
+
+	// Save registry
+	db.registryMu.RLock()
+	err := db.saveRegistryLocked()
+	db.registryMu.RUnlock()
+
+	if err == nil {
+		db.lastRegistrySave = time.Now()
+	}
+
+	return err
+}
+
+// loadRegistry loads the registry from disk (gob format).
+// Returns nil if file doesn't exist (first run).
+func (db *Database) loadRegistry(registryFile string) error {
+	if registryFile == "" {
+		return nil // Registry persistence disabled
+	}
+
+	db.registryFile = registryFile
+
+	// Check if registry file exists
+	f, err := os.Open(registryFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			db.log.Info("Registry file does not exist (first run), starting with empty registry",
+				zap.String("path", registryFile))
+			return nil
+		}
+		return fmt.Errorf("failed to open registry file: %w", err)
+	}
+	defer f.Close()
+
+	// Decode registry from gob format
+	decoder := gob.NewDecoder(f)
+	var registry map[string]bool
+	if err := decoder.Decode(&registry); err != nil {
+		return fmt.Errorf("failed to decode registry (corruption?): %w", err)
+	}
+
+	db.registryMu.Lock()
+	db.registry = registry
+	db.registryMu.Unlock()
+
+	db.log.Info("Loaded registry from disk",
+		zap.String("path", registryFile),
+		zap.Int("keys", len(registry)))
 
 	return nil
 }
@@ -630,6 +755,12 @@ func (b *batch) Write() error {
 		}
 	}
 	b.db.registryMu.Unlock()
+
+	// Persist registry to disk (rate-limited to every 5 minutes)
+	if err := b.db.saveRegistryIfNeeded(); err != nil {
+		b.db.log.Warn("Failed to save registry to disk after batch write", zap.Error(err))
+		// Non-fatal: continue execution, registry will be saved on next attempt
+	}
 
 	b.db.log.Debug("Batch write committed", zap.Int("keysWritten", len(b.ops)))
 

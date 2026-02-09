@@ -26,6 +26,7 @@ func (m *mockDB) Stat(property string) (string, error)        { return "", nil }
 func (m *mockDB) Compact(start []byte, limit []byte) error    { return nil }
 func (m *mockDB) Close() error                                { return nil }
 func (m *mockDB) HealthCheck(ctx context.Context) (interface{}, error) { return nil, nil }
+func (m *mockDB) Ancient(kind string, number uint64) ([]byte, error) { return nil, nil }
 
 // Mock code syncer
 type mockCodeSyncer struct {

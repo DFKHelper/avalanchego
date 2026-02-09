@@ -20,6 +20,7 @@ import (
 
 	"github.com/ava-labs/avalanchego/graft/evm/utils"
 	"github.com/ava-labs/avalanchego/utils/wrappers"
+	"github.com/ava-labs/avalanchego/vms/evm/sync/customrawdb"
 )
 
 // trieToSync keeps the state of a single trie syncing
@@ -48,9 +49,9 @@ type trieToSync struct {
 	// Mode-aware StackTrie wrapper
 	// ModeBlocking: ThreadSafeStackTrie for concurrent access
 	// ModeAsync: Regular StackTrie (sequential access guaranteed)
-	batch            ethdb.Batch
-	stackTrie        *trie.StackTrie // Direct trie (ModeAsync)
-	threadSafeTrie   *ThreadSafeStackTrie // Thread-safe wrapper (ModeBlocking)
+	batch             ethdb.Batch
+	stackTrie         *trie.StackTrie      // Direct trie (ModeAsync)
+	threadSafeTrie    *ThreadSafeStackTrie // Thread-safe wrapper (ModeBlocking)
 	useThreadSafeTrie bool
 
 	// We keep a pointer to the overall sync operation,
@@ -73,14 +74,14 @@ func NewTrieToSync(sync *stateSync, root common.Hash, account common.Hash, syncT
 	}
 
 	trieToSync := &trieToSync{
-		sync:               sync,
-		root:               root,
-		account:            account,
-		batch:              batch,
-		isMainTrie:         (root == sync.root),
-		task:               syncTask,
-		segmentsDone:       make(map[int]struct{}),
-		useThreadSafeTrie:  (sync.config.Mode == ModeBlocking),
+		sync:              sync,
+		root:              root,
+		account:           account,
+		batch:             batch,
+		isMainTrie:        (root == sync.root),
+		task:              syncTask,
+		segmentsDone:      make(map[int]struct{}),
+		useThreadSafeTrie: (sync.config.Mode == ModeBlocking),
 	}
 
 	// Initialize mode-aware StackTrie wrapper
@@ -111,7 +112,7 @@ func (t *trieToSync) loadSegments() error {
 	// Get an iterator for segments for t.root and see if we find anything.
 	// This lets us check if this trie was previously segmented, in which
 	// case we need to restore the same segments on resume.
-	it := t.sync.customrawdb.NewSyncSegmentsIterator(t.sync.db, t.root)
+	it := customrawdb.NewSyncSegmentsIterator(t.sync.db, t.root)
 	defer it.Release()
 
 	// Track the previously added segment as we loop over persisted values.
@@ -124,7 +125,7 @@ func (t *trieToSync) loadSegments() error {
 		// key immediately prior to the segment we found on disk.
 		// This is because we do not persist the beginning of
 		// the first segment.
-		_, segmentStart := t.sync.customrawdb.ParseSyncSegmentKey(it.Key())
+		_, segmentStart := customrawdb.ParseSyncSegmentKey(it.Key())
 		segmentStartPos := binary.BigEndian.Uint16(segmentStart[:wrappers.ShortLen])
 		t.addSegment(prevSegmentStart, addPadding(segmentStartPos-1, 0xff))
 
@@ -186,12 +187,12 @@ func (t *trieToSync) startSyncing(ctx context.Context) error {
 // before multiple segments are syncing concurrently.
 func (t *trieToSync) addSegment(start, end []byte) *trieSegment {
 	segment := &trieSegment{
-		start:             start,
-		end:               end,
-		trie:              t,
-		idx:               len(t.segments),
-		batch:             t.sync.db.NewBatch(),
-		cacheLeafData:     t.useThreadSafeTrie, // Only cache for parallel hashing
+		start:         start,
+		end:           end,
+		trie:          t,
+		idx:           len(t.segments),
+		batch:         t.sync.db.NewBatch(),
+		cacheLeafData: t.useThreadSafeTrie, // Only cache for parallel hashing
 	}
 	t.segments = append(t.segments, segment)
 	return segment
@@ -426,7 +427,7 @@ func (t *trieToSync) segmentFinishedParallel(ctx context.Context, idx int) error
 	}
 
 	// Clean up persistent segment markers
-	if err := t.sync.customrawdb.ClearSyncSegments(t.sync.db, t.root); err != nil {
+	if err := customrawdb.ClearSyncSegments(t.sync.db, t.root); err != nil {
 		return err
 	}
 
@@ -509,7 +510,7 @@ func (t *trieToSync) segmentFinishedSequential(ctx context.Context, idx int) err
 	}
 
 	// remove all segments for this root from persistent storage
-	if err := t.sync.customrawdb.ClearSyncSegments(t.sync.db, t.root); err != nil {
+	if err := customrawdb.ClearSyncSegments(t.sync.db, t.root); err != nil {
 		return err
 	}
 	return t.task.OnFinish()
@@ -588,7 +589,7 @@ func (t *trieToSync) createSegments(ctx context.Context, numSegments int) error 
 
 		// create the segments
 		segment := t.addSegment(startBytes, endBytes)
-		if err := t.sync.customrawdb.WriteSyncSegment(t.sync.db, t.root, common.BytesToHash(segment.start)); err != nil {
+		if err := customrawdb.WriteSyncSegment(t.sync.db, t.root, common.BytesToHash(segment.start)); err != nil {
 			return err
 		}
 	}
@@ -610,7 +611,10 @@ func (t *trieToSync) createSegments(ctx context.Context, numSegments int) error 
 			t.sync.segments <- t.segments[i]
 		}
 	}
-	t.sync.stats.incTriesSegmented()
+	// Type assert stats to call incTriesSegmented
+	if stats, ok := t.sync.stats.(*trieSyncStats); ok && stats != nil {
+		stats.incTriesSegmented()
+	}
 	log.Debug("statesync: trie segmented for parallel sync", "root", t.root, "account", t.account, "segments", len(t.segments))
 	return nil
 }
@@ -632,7 +636,7 @@ type trieSegment struct {
 	// Leaf data caching (ModeBlocking only)
 	// Cache leaf data in memory to avoid re-reading from DB for hashing
 	// This eliminates I/O overhead during the hashing phase
-	cacheLeafData  bool     // whether to cache (true for ModeBlocking)
+	cacheLeafData  bool // whether to cache (true for ModeBlocking)
 	cachedKeys     [][]byte
 	cachedVals     [][]byte
 	cacheAllocated bool // tracks if cache slices have been pre-allocated
@@ -701,8 +705,10 @@ func (t *trieSegment) OnLeafs(ctx context.Context, keys, vals [][]byte) error {
 		}
 	}
 
-	// update eta
-	t.trie.sync.stats.incLeafs(t, uint64(len(keys)), t.estimateSize())
+	// update eta - type assert stats to call incLeafs
+	if stats, ok := t.trie.sync.stats.(*trieSyncStats); ok && stats != nil {
+		stats.incLeafs(t, uint64(len(keys)), t.estimateSize())
+	}
 
 	if t.trie.root == t.trie.sync.root {
 		return t.trie.createSegmentsIfNeeded(ctx, t.trie.sync.numMainTrieSegments)
