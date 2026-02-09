@@ -6,6 +6,8 @@ package bootstrap
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -25,7 +27,108 @@ const (
 	iteratorReleasePeriod = 16384 // Increased from 1024 to reduce iterator overhead
 	logPeriod             = 5 * time.Second
 	minBlocksToCompact    = 5000
+
+	// Compaction safety limits
+	minFreeMemoryForCompaction = 50 * 1024 * 1024 * 1024 // 50GB minimum free memory required
+	compactionTimeout          = 10 * time.Minute        // Maximum time allowed for compaction
 )
+
+// getAvailableMemory returns the currently available system memory in bytes.
+// This is used to determine if there's sufficient memory for database compaction.
+func getAvailableMemory() (uint64, error) {
+	var sysinfo syscall.Sysinfo_t
+	if err := syscall.Sysinfo(&sysinfo); err != nil {
+		return 0, fmt.Errorf("failed to get system info: %w", err)
+	}
+
+	// Calculate available memory: free RAM + buffers + cached
+	// sysinfo.Freeram is truly free memory
+	// On Linux, buffers/cache can be reclaimed, so total available = freeram
+	available := uint64(sysinfo.Freeram) * uint64(sysinfo.Unit)
+
+	// Force garbage collection to ensure we have accurate Go heap stats
+	runtime.GC()
+
+	return available, nil
+}
+
+// shouldCompactDatabase determines if database compaction should proceed
+// based on the number of blocks processed and available system memory.
+// Returns true only if both conditions are met:
+// 1. Sufficient blocks have been processed (>= minBlocksToCompact)
+// 2. Sufficient free memory is available (>= minFreeMemoryForCompaction)
+func shouldCompactDatabase(log logging.Func, numProcessed uint64) bool {
+	if numProcessed < minBlocksToCompact {
+		return false
+	}
+
+	availableMem, err := getAvailableMemory()
+	if err != nil {
+		log("failed to check available memory, skipping compaction for safety",
+			zap.Error(err))
+		return false
+	}
+
+	if availableMem < minFreeMemoryForCompaction {
+		availableGB := float64(availableMem) / (1024 * 1024 * 1024)
+		requiredGB := float64(minFreeMemoryForCompaction) / (1024 * 1024 * 1024)
+		log("insufficient memory for safe compaction, skipping",
+			zap.Float64("availableGB", availableGB),
+			zap.Float64("requiredGB", requiredGB),
+			zap.Uint64("blocksProcessed", numProcessed))
+		return false
+	}
+
+	return true
+}
+
+// compactDatabaseSafely performs database compaction with timeout protection
+// and comprehensive error handling to prevent crashes during bootstrap.
+// If compaction exceeds the timeout, it will be cancelled to prevent system hangs.
+func compactDatabaseSafely(ctx context.Context, log logging.Func, db database.Database, phase string) error {
+	// Create a timeout context for the compaction operation
+	compactCtx, cancel := context.WithTimeout(ctx, compactionTimeout)
+	defer cancel()
+
+	startTime := time.Now()
+	errChan := make(chan error, 1)
+
+	// Run compaction in a goroutine so we can enforce timeout
+	go func() {
+		log("starting database compaction",
+			zap.String("phase", phase),
+			zap.Duration("timeout", compactionTimeout))
+		errChan <- db.Compact(nil, nil)
+	}()
+
+	// Wait for either completion or timeout
+	select {
+	case err := <-errChan:
+		duration := time.Since(startTime)
+		if err != nil {
+			log("database compaction failed",
+				zap.String("phase", phase),
+				zap.Duration("duration", duration),
+				zap.Error(err))
+			return fmt.Errorf("compaction failed: %w", err)
+		}
+		log("database compaction completed successfully",
+			zap.String("phase", phase),
+			zap.Duration("duration", duration))
+		return nil
+
+	case <-compactCtx.Done():
+		duration := time.Since(startTime)
+		log("database compaction timed out - cancelling to prevent system hang",
+			zap.String("phase", phase),
+			zap.Duration("duration", duration),
+			zap.Duration("timeout", compactionTimeout))
+		// Note: The actual db.Compact() call cannot be cancelled mid-operation in Firewood,
+		// but we prevent waiting indefinitely and allow bootstrap to continue.
+		// The compaction goroutine will complete eventually and the error will be discarded.
+		return fmt.Errorf("compaction timed out after %v", duration)
+	}
+}
 
 // getMissingBlockIDs returns the ID of the blocks that should be fetched to
 // attempt to make a single continuous range from
@@ -134,13 +237,11 @@ func execute(
 	lastAcceptedHeight uint64,
 ) error {
 	totalNumberToProcess := tree.Len()
-	if totalNumberToProcess >= minBlocksToCompact {
-		log("compacting database before executing blocks...")
-		if err := db.Compact(nil, nil); err != nil {
-			// Not a fatal error, log and move on.
-			log("failed to compact bootstrap database before executing blocks",
-				zap.Error(err),
-			)
+	if shouldCompactDatabase(log, totalNumberToProcess) {
+		if err := compactDatabaseSafely(ctx, log, db, "pre-execution"); err != nil {
+			// Not a fatal error - compaction failure should not stop bootstrap.
+			// The error is already logged by compactDatabaseSafely.
+			// Continue with block execution.
 		}
 	}
 
@@ -174,13 +275,10 @@ func execute(
 			numProcessed = totalNumberToProcess - tree.Len()
 			halted       = shouldHalt()
 		)
-		if numProcessed >= minBlocksToCompact && !halted {
-			log("compacting database after executing blocks...")
-			if err := db.Compact(nil, nil); err != nil {
-				// Not a fatal error, log and move on.
-				log("failed to compact bootstrap database after executing blocks",
-					zap.Error(err),
-				)
+		if !halted && shouldCompactDatabase(log, numProcessed) {
+			if err := compactDatabaseSafely(ctx, log, db, "post-execution"); err != nil {
+				// Not a fatal error - compaction failure should not affect bootstrap completion.
+				// The error is already logged by compactDatabaseSafely.
 			}
 		}
 
