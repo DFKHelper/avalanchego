@@ -154,7 +154,7 @@ func New(config Config, onFinished func(ctx context.Context, lastReqID uint32) e
 	// Set checkpoint interval from config or use default
 	checkpointInterval := config.CheckpointInterval
 	if checkpointInterval == 0 {
-		checkpointInterval = 50000 // Default: 50,000 blocks (optimized for recovery)
+		checkpointInterval = 5000 // Default: 5,000 blocks (~14 sec max loss vs 142 sec)
 	}
 
 	bs := &Bootstrapper{
@@ -975,6 +975,101 @@ func (b *Bootstrapper) tryStartExecuting(ctx context.Context) error {
 	}
 
 	numToExecute := b.tree.Len()
+
+	// Check for execute checkpoint from previous run
+	executeCheckpoint, err := interval.GetExecuteCheckpoint(b.DB)
+	if err == nil && executeCheckpoint != nil {
+		// Validate execute checkpoint
+		if executeCheckpoint.StartingHeight == b.startingHeight &&
+			executeCheckpoint.TotalToExecute == numToExecute &&
+			time.Since(executeCheckpoint.Timestamp) < 7*24*time.Hour {
+			b.Ctx.Log.Info("found execute checkpoint from previous run",
+				zap.Uint64("numExecuted", executeCheckpoint.NumExecuted),
+				zap.Uint64("totalToExecute", executeCheckpoint.TotalToExecute),
+				zap.Float64("pctComplete", float64(executeCheckpoint.NumExecuted)/float64(executeCheckpoint.TotalToExecute)*100),
+				zap.Duration("age", time.Since(executeCheckpoint.Timestamp)),
+			)
+
+			// Restore ETA tracker samples if available
+			if len(executeCheckpoint.ETASamples) > 0 {
+				b.etaTracker.RestoreSamples(executeCheckpoint.ETASamples)
+			}
+		} else {
+			// Stale or invalid checkpoint, delete it
+			b.Ctx.Log.Warn("execute checkpoint invalid or stale, discarding",
+				zap.Uint64("checkpointStartingHeight", executeCheckpoint.StartingHeight),
+				zap.Uint64("currentStartingHeight", b.startingHeight),
+				zap.Uint64("checkpointTotal", executeCheckpoint.TotalToExecute),
+				zap.Uint64("currentTotal", numToExecute),
+			)
+			if err := interval.DeleteExecuteCheckpoint(b.DB); err != nil {
+				b.Ctx.Log.Warn("failed to delete stale execute checkpoint", zap.Error(err))
+			}
+		}
+	}
+
+	// Check external checkpoint file for data loss detection
+	// If external file shows more progress than Firewood, database lost data during crash
+	extPath := filepath.Join(os.TempDir(), fmt.Sprintf("avalanche-bootstrap-%s.json", b.Ctx.ChainID))
+	if extData, readErr := os.ReadFile(extPath); readErr == nil {
+		b.Ctx.Log.Info("external bootstrap checkpoint found",
+			zap.String("path", extPath),
+			zap.String("content", string(extData)),
+			zap.Uint64("currentStartingHeight", b.startingHeight),
+			zap.Uint64("blocksToExecute", numToExecute),
+		)
+		// If database checkpoint was not found but external file exists,
+		// Firewood likely lost data during a crash
+		if executeCheckpoint == nil {
+			b.Ctx.Log.Error("DATABASE DATA LOSS DETECTED: external checkpoint exists but database has no checkpoint. " +
+				"Firewood may have lost committed data during a crash. Bootstrap will restart from scratch.",
+				zap.String("externalCheckpoint", string(extData)),
+			)
+		}
+	}
+
+	// Create checkpoint callback for execute phase
+	onCheckpoint := func(numExecuted, totalToExecute uint64) error {
+		checkpoint := &interval.ExecuteCheckpoint{
+			NumExecuted:        numExecuted,
+			TotalToExecute:     totalToExecute,
+			LastAcceptedHeight: b.startingHeight,
+			StartingHeight:     b.startingHeight,
+			Timestamp:          time.Now(),
+			ETASamples:         b.etaTracker.GetSamples(),
+		}
+
+		if err := interval.PutExecuteCheckpoint(b.DB, checkpoint); err != nil {
+			return fmt.Errorf("failed to save execute checkpoint: %w", err)
+		}
+
+		// Save external checkpoint file (survives database crashes)
+		// This ensures we always know the last progress even if the database resets
+		pctComplete := float64(numExecuted) / float64(totalToExecute) * 100
+		externalCheckpoint := fmt.Sprintf(
+			`{"chain":"%s","numExecuted":%d,"totalToExecute":%d,"pctComplete":%.2f,"timestamp":"%s"}`,
+			b.Ctx.ChainID,
+			numExecuted,
+			totalToExecute,
+			pctComplete,
+			time.Now().Format(time.RFC3339),
+		)
+		extPath := filepath.Join(os.TempDir(), fmt.Sprintf("avalanche-bootstrap-%s.json", b.Ctx.ChainID))
+		if writeErr := os.WriteFile(extPath, []byte(externalCheckpoint+"\n"), 0644); writeErr != nil {
+			b.Ctx.Log.Warn("failed to write external checkpoint file",
+				zap.String("path", extPath),
+				zap.Error(writeErr),
+			)
+		}
+
+		b.Ctx.Log.Info("execute checkpoint created",
+			zap.Uint64("numExecuted", numExecuted),
+			zap.Uint64("totalToExecute", totalToExecute),
+			zap.Float64("pctComplete", pctComplete),
+		)
+		return nil
+	}
+
 	err = execute(
 		ctx,
 		b.Halted,
@@ -987,6 +1082,7 @@ func (b *Bootstrapper) tryStartExecuting(ctx context.Context) error {
 		},
 		b.tree,
 		lastAccepted.Height(),
+		onCheckpoint,
 	)
 	if err != nil {
 		// If a fatal error has occurred, include the last accepted block
@@ -1005,19 +1101,18 @@ func (b *Bootstrapper) tryStartExecuting(ctx context.Context) error {
 		return nil
 	}
 
-	previouslyExecuted := b.executedStateTransitions
-	b.executedStateTransitions = numToExecute
-
-	// Delete checkpoint after successful execution
-	// This prevents stale checkpoint from affecting future syncs
-	if err := interval.DeleteFetchCheckpoint(b.DB); err != nil && !errors.Is(err, database.ErrNotFound) {
-		b.Ctx.Log.Warn("failed to delete checkpoint after execution",
+	// Delete execute checkpoint after successful execution
+	if err := interval.DeleteExecuteCheckpoint(b.DB); err != nil && !errors.Is(err, database.ErrNotFound) {
+		b.Ctx.Log.Warn("failed to delete execute checkpoint after successful execution",
 			zap.Error(err),
 		)
 		// Non-fatal: continue with bootstrapping
 	} else if err == nil {
-		b.Ctx.Log.Debug("checkpoint deleted after successful execution")
+		b.Ctx.Log.Info("execute checkpoint deleted after successful execution")
 	}
+
+	previouslyExecuted := b.executedStateTransitions
+	b.executedStateTransitions = numToExecute
 
 	// Note that executedBlocks < c*previouslyExecuted ( 0 <= c < 1 ) is enforced
 	// so that the bootstrapping process will terminate even as new blocks are
@@ -1045,6 +1140,17 @@ func (b *Bootstrapper) tryStartExecuting(ctx context.Context) error {
 
 	// Notify the subnet that this chain is synced
 	b.Config.BootstrapTracker.Bootstrapped(b.Ctx.ChainID)
+
+	// Delete checkpoint ONLY after chain is fully bootstrapped
+	// This ensures checkpoint survives crashes during long execution phases
+	if err := interval.DeleteFetchCheckpoint(b.DB); err != nil && !errors.Is(err, database.ErrNotFound) {
+		b.Ctx.Log.Warn("failed to delete checkpoint after bootstrap completion",
+			zap.Error(err),
+		)
+		// Non-fatal: continue with bootstrapping
+	} else if err == nil {
+		b.Ctx.Log.Info("checkpoint deleted after successful bootstrap completion")
+	}
 
 	// If the subnet hasn't finished bootstrapping, this chain should remain
 	// syncing.
@@ -1409,10 +1515,10 @@ func (b *Bootstrapper) RecoverFromStateCorruption(ctx context.Context, corruptio
 	// validator set loaded but historical AddValidatorTx transactions unindexed,
 	// causing "transaction not found" errors when processing RewardValidatorTx.
 	safeCheckpoint := &interval.FetchCheckpoint{
-		Height:              0, // CRITICAL: Restart from genesis after state deletion
+		Height:              0,                    // CRITICAL: Restart from genesis after state deletion
 		TipHeight:           checkpoint.TipHeight, // Keep same tip
-		StartingHeight:      0, // Also reset starting height
-		NumBlocksFetched:    0, // Will be recalculated during resume
+		StartingHeight:      0,                    // Also reset starting height
+		NumBlocksFetched:    0,                    // Will be recalculated during resume
 		Timestamp:           time.Now(),
 		MissingBlockIDCount: 0,
 		ETASamples:          nil, // Reset ETA
@@ -1453,8 +1559,8 @@ func (b *Bootstrapper) RecoverFromStateCorruption(ctx context.Context, corruptio
 	//
 	// The actual database path is: ~/.avalanchego/db/{network}/{version}/{chainID}
 	// We derive this from ChainDataDir which is: ~/.avalanchego/chainData/{chainID}
-	chainDataBase := filepath.Dir(b.Ctx.ChainDataDir)  // Get parent of chainData/CHAINID
-	avalanchegoDir := filepath.Dir(chainDataBase)       // Get ~/.avalanchego
+	chainDataBase := filepath.Dir(b.Ctx.ChainDataDir) // Get parent of chainData/CHAINID
+	avalanchegoDir := filepath.Dir(chainDataBase)     // Get ~/.avalanchego
 
 	// Construct the VM state database path
 	// TODO: Get network name and DB version from config instead of hardcoding

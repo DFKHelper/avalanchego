@@ -59,6 +59,13 @@ type Config struct {
 	// Lower values = lower memory but more frequent commits
 	// Recommended: 1000 for most use cases
 	FlushSize int `json:"flushSize"`
+
+	// RootStore enables persisting historical revisions to disk.
+	// Without this, revisions only exist in memory and are lost on restart.
+	// CRITICAL: Must be true for data to survive process restarts.
+	// When enabled, Firewood uses a root_store/ subdirectory to persist
+	// revision history, allowing the database to recover its state on restart.
+	RootStore bool `json:"rootStore"`
 }
 
 // DefaultConfig returns the default Firewood configuration
@@ -69,5 +76,6 @@ func DefaultConfig() Config {
 		RevisionsInMemory:    DefaultRevisionsInMemory,
 		CacheStrategy:        ffi.CacheAllReads, // Default: cache all reads
 		FlushSize:            DefaultFlushSize,
+		RootStore:            true, // CRITICAL: enables disk persistence across restarts
 	}
 }

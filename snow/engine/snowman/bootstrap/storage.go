@@ -6,8 +6,6 @@ package bootstrap
 import (
 	"context"
 	"fmt"
-	"runtime"
-	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -23,7 +21,7 @@ import (
 )
 
 const (
-	batchWritePeriod      = 512   // Increased from 64 to reduce DB write frequency during sync
+	batchWritePeriod      = 128   // Reduced from 512 for better crash safety (safety > optimization)
 	iteratorReleasePeriod = 16384 // Increased from 1024 to reduce iterator overhead
 	logPeriod             = 5 * time.Second
 	minBlocksToCompact    = 5000
@@ -33,24 +31,9 @@ const (
 	compactionTimeout          = 10 * time.Minute        // Maximum time allowed for compaction
 )
 
-// getAvailableMemory returns the currently available system memory in bytes.
-// This is used to determine if there's sufficient memory for database compaction.
-func getAvailableMemory() (uint64, error) {
-	var sysinfo syscall.Sysinfo_t
-	if err := syscall.Sysinfo(&sysinfo); err != nil {
-		return 0, fmt.Errorf("failed to get system info: %w", err)
-	}
-
-	// Calculate available memory: free RAM + buffers + cached
-	// sysinfo.Freeram is truly free memory
-	// On Linux, buffers/cache can be reclaimed, so total available = freeram
-	available := uint64(sysinfo.Freeram) * uint64(sysinfo.Unit)
-
-	// Force garbage collection to ensure we have accurate Go heap stats
-	runtime.GC()
-
-	return available, nil
-}
+// getAvailableMemory is implemented in platform-specific files:
+// - storage_linux.go for Linux
+// - storage_windows.go for Windows
 
 // shouldCompactDatabase determines if database compaction should proceed
 // based on the number of blocks processed and available system memory.
@@ -226,6 +209,9 @@ func process(
 //
 // execute assumes that getMissingBlockIDs would return an empty set.
 //
+// The onCheckpoint callback is called periodically during execution to save progress.
+// If nil, no checkpoints are created during execution.
+//
 // TODO: Replace usage of haltable with context cancellation.
 func execute(
 	ctx context.Context,
@@ -235,6 +221,7 @@ func execute(
 	nonVerifyingParser block.Parser,
 	tree *interval.Tree,
 	lastAcceptedHeight uint64,
+	onCheckpoint func(numExecuted, totalToExecute uint64) error,
 ) error {
 	totalNumberToProcess := tree.Len()
 	if shouldCompactDatabase(log, totalNumberToProcess) {
@@ -244,6 +231,10 @@ func execute(
 			// Continue with block execution.
 		}
 	}
+
+	const (
+		checkpointInterval = 5000 // Create execute checkpoint every 5,000 blocks
+	)
 
 	var (
 		batch                    = db.NewBatch()
@@ -264,9 +255,10 @@ func execute(
 		iterator                      = interval.GetBlockIterator(db)
 		processedSinceIteratorRelease uint
 
-		startTime     = time.Now()
-		timeOfNextLog = startTime.Add(logPeriod)
-		etaTracker    = timer.NewEtaTracker(10, 1.2)
+		startTime                = time.Now()
+		timeOfNextLog            = startTime.Add(logPeriod)
+		etaTracker               = timer.NewEtaTracker(10, 1.2)
+		processedSinceCheckpoint uint
 	)
 	defer func() {
 		iterator.Release()
@@ -365,17 +357,70 @@ func execute(
 			timeOfNextLog = now.Add(logPeriod)
 		}
 
+		// Create execute checkpoint periodically
+		processedSinceCheckpoint++
+		if onCheckpoint != nil && processedSinceCheckpoint >= checkpointInterval {
+			numProcessed := totalNumberToProcess - tree.Len()
+
+			// Write batch FIRST to ensure checkpoint reflects persisted state
+			if err := writeBatch(); err != nil {
+				return err
+			}
+
+			// Create checkpoint (non-fatal if fails)
+			if err := onCheckpoint(numProcessed, totalNumberToProcess); err != nil {
+				log("failed to create execute checkpoint",
+					zap.Error(err),
+					zap.Uint64("numProcessed", numProcessed),
+				)
+				// Continue execution even if checkpoint fails
+			}
+
+			processedSinceCheckpoint = 0
+		}
+
 		if height <= lastAcceptedHeight {
 			continue
 		}
 
 		if err := blk.Verify(ctx); err != nil {
-			return fmt.Errorf("failed to verify block %s (height=%d, parentID=%s) in bootstrapping: %w",
-				blk.ID(),
-				height,
-				blk.Parent(),
-				err,
-			)
+			// Self-healing: retry block verification with increasing delays
+			// Firewood may have post-commit visibility delays on the FFI boundary
+			var retryErr error
+			healed := false
+			for attempt := 1; attempt <= 3; attempt++ {
+				log("block verification failed, retrying",
+					zap.Uint64("height", height),
+					zap.Int("attempt", attempt),
+					zap.Error(err),
+				)
+
+				// Flush any pending batch writes before retry
+				if flushErr := writeBatch(); flushErr != nil {
+					return flushErr
+				}
+
+				// Exponential backoff: 50ms, 200ms, 500ms
+				time.Sleep(time.Duration(attempt*attempt*50) * time.Millisecond)
+
+				retryErr = blk.Verify(ctx)
+				if retryErr == nil {
+					log("block verification HEALED on retry",
+						zap.Uint64("height", height),
+						zap.Int("attempt", attempt),
+					)
+					healed = true
+					break
+				}
+			}
+			if !healed {
+				return fmt.Errorf("failed to verify block %s (height=%d, parentID=%s) in bootstrapping after 3 retries: %w",
+					blk.ID(),
+					height,
+					blk.Parent(),
+					retryErr,
+				)
+			}
 		}
 		if err := blk.Accept(ctx); err != nil {
 			return fmt.Errorf("failed to accept block %s (height=%d, parentID=%s) in bootstrapping: %w",
