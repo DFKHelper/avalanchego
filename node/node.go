@@ -4,6 +4,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/tls"
@@ -868,25 +869,86 @@ func (n *Node) runDatabaseHealthChecks(db database.Database) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
+	const (
+		maxRetries    = 3
+		retryDelay    = 5 * time.Second
+		healthTimeout = 30 * time.Second
+	)
+
 	for {
 		select {
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			_, err := db.HealthCheck(ctx)
-			cancel()
+			var lastErr error
+			healthCheckPassed := false
 
-			if err != nil {
-				n.Log.Error("database health check failed - potential corruption detected",
+			// Retry health check multiple times to handle transient errors
+			for attempt := 1; attempt <= maxRetries; attempt++ {
+				ctx, cancel := context.WithTimeout(context.Background(), healthTimeout)
+				_, err := db.HealthCheck(ctx)
+				cancel()
+
+				if err == nil {
+					healthCheckPassed = true
+					break
+				}
+
+				lastErr = err
+
+				// Check if error is database.ErrClosed (temporary state during registry save)
+				if errors.Is(err, database.ErrClosed) {
+					n.Log.Warn("database temporarily closed (likely registry save in progress)",
+						zap.Int("attempt", attempt),
+						zap.Int("maxRetries", maxRetries),
+					)
+					// Wait before retry for temporary closure to complete
+					if attempt < maxRetries {
+						time.Sleep(retryDelay)
+						continue
+					}
+					// If still closed after all retries, this might be a real issue
+					break
+				}
+
+				// For other errors, log and retry
+				n.Log.Warn("database health check failed, retrying",
 					zap.Error(err),
+					zap.Int("attempt", attempt),
+					zap.Int("maxRetries", maxRetries),
 				)
 
-				// Trigger graceful shutdown if health check fails
-				// This prevents further damage to the database
-				n.Log.Fatal("shutting down node due to database health check failure")
-				os.Exit(1)
+				if attempt < maxRetries {
+					time.Sleep(retryDelay)
+				}
 			}
 
-			n.Log.Debug("database health check passed")
+			if healthCheckPassed {
+				n.Log.Debug("database health check passed")
+				continue
+			}
+
+			// If we get here, health check failed after all retries
+			if errors.Is(lastErr, database.ErrClosed) {
+				// Still closed after all retries - database may be stuck
+				// This is unusual but not necessarily corruption
+				n.Log.Error("database remains closed after all retry attempts - possible deadlock or long operation",
+					zap.Error(lastErr),
+					zap.Int("retries", maxRetries),
+				)
+				// Don't kill node - database might recover
+				// User can monitor logs and restart manually if needed
+				continue
+			}
+
+			// Non-transient error detected - likely corruption
+			n.Log.Error("database health check failed persistently - potential corruption detected",
+				zap.Error(lastErr),
+				zap.Int("retriesAttempted", maxRetries),
+			)
+
+			// Trigger graceful shutdown for persistent corruption
+			// This prevents further damage to the database
+			n.Log.Fatal("shutting down node due to persistent database health check failure")
+			os.Exit(1)
 		}
 	}
 }
@@ -1603,7 +1665,7 @@ func (n *Node) initHealthAPI() error {
 		}
 
 		nodePK := n.StakingSigner.PublicKey()
-		if nodePK.Equals(vdrPK) {
+		if bytes.Equal(bls.PublicKeyToCompressedBytes(nodePK), bls.PublicKeyToCompressedBytes(vdrPK)) {
 			return "node has the correct BLS key", nil
 		}
 		return nil, fmt.Errorf("node has BLS key 0x%x, but is registered to the validator set with 0x%x",

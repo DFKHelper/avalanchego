@@ -8,11 +8,9 @@ package firewood
 
 import (
 	"bytes"
-	"sort"
 
 	"github.com/ava-labs/avalanchego/database"
-	"github.com/ava-labs/avalanchego/utils/logging"
-	"go.uber.org/zap"
+	"github.com/ava-labs/firewood-go-ethhash/ffi"
 )
 
 // pendingKV represents a key-value operation (put or delete) in pending batch
@@ -22,166 +20,266 @@ type pendingKV struct {
 	delete bool
 }
 
-// iterator implements database.Iterator for Firewood
+// nativeIterator implements database.Iterator using Firewood's native FFI trie iterator.
 //
-// Architecture: Registry-based iterator
-// - Firewood's rev.Iter() returns merkle nodes (97-129 bytes), not actual keys
-// - Instead, we maintain a registry of all committed keys
-// - Iterator uses this registry to iterate over actual keys
-// - Values are fetched from Firewood database on demand
+// Architecture:
+// - Uses Firewood's Revision.Iter() to iterate directly over the persisted trie
+// - Merges with pending (uncommitted) operations for read-your-writes consistency
+// - Works correctly after restart because it reads from the trie, not from a registry
 //
-// The iterator merges:
-// 1. Registered committed keys from database registry
-// 2. Pending operations not yet flushed (from Database.pending)
-type iterator struct {
-	// Sorted list of all keys to iterate
-	// Combined from: registered keys + pending operations (non-deleted)
-	allKeys [][]byte
-	keyIdx  int // Current index in allKeys
+// Merge algorithm:
+// - FFI iterator provides sorted key-value pairs from the committed trie
+// - Pending operations are pre-sorted and pre-filtered by prefix/start
+// - FFI keys that have ANY pending operation (put or delete) are suppressed
+// - Only pending put operations are yielded (deletes suppress FFI keys only)
+// - Standard sorted merge of the two clean streams produces correct output
+type nativeIterator struct {
+	// FFI resources (nil if database is empty or Revision unavailable)
+	ffiIter  *ffi.Iterator
+	revision *ffi.Revision
 
-	// Database reference for fetching values
-	db  *Database
-	log logging.Logger
+	// FFI cursor state
+	ffiKey   []byte
+	ffiValue []byte
+	ffiDone  bool
 
-	// Current state
-	currentKey   []byte // Current key
-	currentValue []byte // Current value
-	err          error
-	released     bool
+	// Pending operations cursor (sorted, filtered by prefix/start)
+	pending    []pendingKV
+	pendingIdx int // Index of current pending entry (-1 = before start)
 
-	// Optional filters
-	startKey []byte // Only iterate keys >= startKey
-	prefix   []byte // Only iterate keys with this prefix
+	// Set of ALL pending keys (puts + deletes) for suppressing FFI duplicates
+	pendingKeys map[string]bool
+
+	// Prefix filter (empty = no filter)
+	prefix []byte
+
+	// Current output
+	currentKey   []byte
+	currentValue []byte
+
+	// State
+	err      error
+	released bool
+	started  bool
 }
 
-// newIterator creates a new registry-based iterator
-// It combines committed keys from the registry with pending operations
-func newIterator(
-	db *Database,
+// newNativeIterator creates an iterator using Firewood's native FFI trie iterator.
+// Returns a database.Iterator that merges committed trie data with pending operations.
+//
+// If the database is empty or the Revision is unavailable, falls back to iterating
+// only pending operations (graceful degradation).
+func newNativeIterator(
+	fw *ffi.Database,
+	currentRoot ffi.Hash,
 	pending []pendingKV,
 	startKey []byte,
 	prefix []byte,
-	log logging.Logger,
-) *iterator {
-	// Collect all unique keys from registry + pending
-	keySet := make(map[string]bool)
-	allKeys := make([][]byte, 0)
-
-	// Add registered keys from database
-	db.registryMu.RLock()
-	for keyStr := range db.registry {
-		key := []byte(keyStr)
-		keySet[keyStr] = true
-		allKeys = append(allKeys, key)
+) database.Iterator {
+	// CRITICAL: Make defensive copies of prefix and startKey.
+	// PrefixDB passes byte slices from its buffer pool, then returns the buffers
+	// to the pool via defer after this function returns. Without copies, the
+	// iterator's prefix field would reference pool memory that gets overwritten
+	// by subsequent PrefixDB operations, causing premature iterator termination.
+	var prefixCopy []byte
+	if len(prefix) > 0 {
+		prefixCopy = make([]byte, len(prefix))
+		copy(prefixCopy, prefix)
 	}
-	db.registryMu.RUnlock()
+	var startKeyCopy []byte
+	if len(startKey) > 0 {
+		startKeyCopy = make([]byte, len(startKey))
+		copy(startKeyCopy, startKey)
+	}
 
-	// Add pending keys (overriding registry if present)
+	// Build the set of ALL pending keys for FFI suppression
+	pendingKeys := make(map[string]bool, len(pending))
 	for _, op := range pending {
-		keyStr := string(op.key)
-		if op.delete {
-			// Delete operation: remove from set
-			delete(keySet, keyStr)
-			// We don't add deleted keys to allKeys
-		} else {
-			// Put operation: add if not already present
-			if !keySet[keyStr] {
-				allKeys = append(allKeys, op.key)
+		pendingKeys[string(op.key)] = true
+	}
+
+	it := &nativeIterator{
+		ffiDone:     true, // Will be set to false if FFI iterator created successfully
+		pending:     pending,
+		pendingIdx:  -1,
+		pendingKeys: pendingKeys,
+		prefix:      prefixCopy,
+	}
+
+	// Empty database: iterate only pending ops
+	if currentRoot == ffi.EmptyRoot {
+		return it
+	}
+
+	// Get a revision handle for the current root.
+	// This reads from the persisted trie, so it works after restart.
+	revision, err := fw.Revision(currentRoot)
+	if err != nil {
+		// Revision unavailable - iterate only pending ops (graceful degradation)
+		return it
+	}
+
+	// Determine FFI iterator start position.
+	// Use the greater of startKey and prefix as the starting point.
+	iterStart := startKeyCopy
+	if len(prefixCopy) > 0 && (len(iterStart) == 0 || bytes.Compare(prefixCopy, iterStart) > 0) {
+		iterStart = prefixCopy
+	}
+	if iterStart == nil {
+		iterStart = []byte{} // FFI expects non-nil slice for "start from beginning"
+	}
+
+	ffiIter, err := revision.Iter(iterStart)
+	if err != nil {
+		revision.Drop()
+		return it
+	}
+
+	// Batch loading reduces FFI call overhead during iteration
+	ffiIter.SetBatchSize(256)
+
+	it.ffiIter = ffiIter
+	it.revision = revision
+	it.ffiDone = false
+
+	return it
+}
+
+// advanceFFI moves the FFI cursor to the next valid key.
+// Skips keys outside the prefix range and keys with pending operations.
+func (it *nativeIterator) advanceFFI() {
+	if it.ffiIter == nil {
+		it.ffiDone = true
+		return
+	}
+
+	for {
+		if !it.ffiIter.Next() {
+			it.ffiDone = true
+			if err := it.ffiIter.Err(); err != nil {
+				it.err = err
+			}
+			return
+		}
+
+		key := it.ffiIter.Key()
+
+		// Prefix boundary check
+		if len(it.prefix) > 0 {
+			if !bytes.HasPrefix(key, it.prefix) {
+				if bytes.Compare(key, it.prefix) > 0 {
+					// Past the prefix range, iteration is done
+					it.ffiDone = true
+					return
+				}
+				continue // Before prefix range (shouldn't happen with proper start)
 			}
 		}
-	}
 
-	// Sort keys for consistent iteration order
-	sort.Slice(allKeys, func(i, j int) bool {
-		return bytes.Compare(allKeys[i], allKeys[j]) < 0
-	})
-
-	// Filter by startKey and prefix if specified
-	filtered := make([][]byte, 0, len(allKeys))
-	for _, key := range allKeys {
-		// Skip keys before startKey if specified
-		if len(startKey) > 0 && bytes.Compare(key, startKey) < 0 {
+		// Skip keys that have pending operations (pending always takes precedence)
+		if it.pendingKeys[string(key)] {
 			continue
 		}
 
-		// Skip keys without prefix if specified
-		if len(prefix) > 0 && !bytes.HasPrefix(key, prefix) {
-			continue
-		}
-
-		filtered = append(filtered, key)
-	}
-
-	if log != nil {
-		log.Debug("Created new registry-based iterator",
-			zap.Int("totalKeys", len(filtered)),
-			zap.Int("pendingOps", len(pending)),
-			zap.Bool("hasStartKey", len(startKey) > 0),
-			zap.Bool("hasPrefix", len(prefix) > 0),
-		)
-	}
-
-	return &iterator{
-		allKeys:  filtered,
-		keyIdx:   -1, // Start before first key
-		db:       db,
-		log:      log,
-		startKey: startKey,
-		prefix:   prefix,
+		// Valid key: copy data (FFI memory may be reused on next advance)
+		it.ffiKey = make([]byte, len(key))
+		copy(it.ffiKey, key)
+		val := it.ffiIter.Value()
+		it.ffiValue = make([]byte, len(val))
+		copy(it.ffiValue, val)
+		return
 	}
 }
 
+// advancePending moves the pending cursor to the next non-delete entry.
+// Delete operations are only used for suppressing FFI keys (via pendingKeys).
+func (it *nativeIterator) advancePending() {
+	for {
+		it.pendingIdx++
+		if it.pendingIdx >= len(it.pending) {
+			return
+		}
+		if !it.pending[it.pendingIdx].delete {
+			return // Found a put operation to yield
+		}
+	}
+}
+
+// pendingCurrent returns the current pending entry, or nil if exhausted.
+func (it *nativeIterator) pendingCurrent() *pendingKV {
+	if it.pendingIdx >= 0 && it.pendingIdx < len(it.pending) {
+		return &it.pending[it.pendingIdx]
+	}
+	return nil
+}
+
 // Next implements database.Iterator
-// Advances to the next key-value pair.
-// Returns true if valid, false if done or error.
-func (it *iterator) Next() bool {
+func (it *nativeIterator) Next() bool {
 	if it.released {
 		it.err = database.ErrClosed
 		return false
 	}
-
-	// Advance to next key
-	it.keyIdx++
-
-	// Check if we've exhausted all keys
-	if it.keyIdx >= len(it.allKeys) {
+	if it.err != nil {
 		return false
 	}
 
-	// Get the current key
-	key := it.allKeys[it.keyIdx]
-	it.currentKey = key
+	// First call: prime both cursors
+	if !it.started {
+		it.started = true
+		it.advanceFFI()
+		it.advancePending()
+	}
 
-	// Fetch value from database (checks pending first, then Firewood)
-	value, err := it.db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			// Key was deleted, skip it and continue
-			if it.log != nil {
-				it.log.Debug("Iterator: key not found (likely deleted)",
-					zap.Int("keyIndex", it.keyIdx),
-				)
-			}
-			return it.Next() // Skip and get next
-		}
-		// Real error
-		it.err = err
+	hasFfi := !it.ffiDone
+	pCur := it.pendingCurrent()
+
+	if !hasFfi && pCur == nil {
 		return false
 	}
 
-	it.currentValue = value
+	if hasFfi && pCur == nil {
+		// Only FFI data remains
+		it.currentKey = it.ffiKey
+		it.currentValue = it.ffiValue
+		it.advanceFFI()
+		return true
+	}
+
+	if !hasFfi {
+		// Only pending data remains
+		it.currentKey = pCur.key
+		it.currentValue = pCur.value
+		it.advancePending()
+		return true
+	}
+
+	// Both have data: standard sorted merge - pick the smaller key
+	cmp := bytes.Compare(it.ffiKey, pCur.key)
+	if cmp < 0 {
+		it.currentKey = it.ffiKey
+		it.currentValue = it.ffiValue
+		it.advanceFFI()
+	} else if cmp > 0 {
+		it.currentKey = pCur.key
+		it.currentValue = pCur.value
+		it.advancePending()
+	} else {
+		// Same key: pending wins, advance both cursors
+		it.currentKey = pCur.key
+		it.currentValue = pCur.value
+		it.advanceFFI()
+		it.advancePending()
+	}
+
 	return true
 }
 
 // Error implements database.Iterator
-// Returns any accumulated error.
-func (it *iterator) Error() error {
+func (it *nativeIterator) Error() error {
 	return it.err
 }
 
 // Key implements database.Iterator
-// Returns the key of the current pair, or nil if done.
-func (it *iterator) Key() []byte {
+func (it *nativeIterator) Key() []byte {
 	if it.released || it.err != nil {
 		return nil
 	}
@@ -189,8 +287,7 @@ func (it *iterator) Key() []byte {
 }
 
 // Value implements database.Iterator
-// Returns the value of the current pair, or nil if done.
-func (it *iterator) Value() []byte {
+func (it *nativeIterator) Value() []byte {
 	if it.released || it.err != nil {
 		return nil
 	}
@@ -198,21 +295,36 @@ func (it *iterator) Value() []byte {
 }
 
 // Release implements database.Iterator
-// Releases associated resources.
-func (it *iterator) Release() {
+func (it *nativeIterator) Release() {
+	if it.released {
+		return
+	}
 	it.released = true
-	it.allKeys = nil
+
+	// Release FFI resources
+	if it.ffiIter != nil {
+		it.ffiIter.Drop()
+		it.ffiIter = nil
+	}
+	if it.revision != nil {
+		it.revision.Drop()
+		it.revision = nil
+	}
+
 	it.currentKey = nil
 	it.currentValue = nil
+	it.ffiKey = nil
+	it.ffiValue = nil
+	it.pending = nil
+	it.pendingKeys = nil
 }
 
-// errorIterator is a special iterator that always returns an error
-// Used when database is closed or operations fail
+// errorIterator is a special iterator that always returns an error.
+// Used when database is closed or initialization fails.
 type errorIterator struct {
 	err error
 }
 
-// newErrorIterator creates an iterator that always returns the given error
 func newErrorIterator(err error) database.Iterator {
 	return &errorIterator{err: err}
 }

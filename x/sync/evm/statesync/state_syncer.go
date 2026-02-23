@@ -541,7 +541,7 @@ func (t *stateSync) Finalize() error {
 	defer t.lock.RUnlock()
 
 	// Write all in-progress trie segment batches
-	for _, trie := range t.triesInProgress {
+	for range t.triesInProgress {
 		// In real implementation:
 		// for _, segment := range trie.segments {
 		//     segment.batch.Write()
@@ -585,7 +585,7 @@ func (t *stateSync) onSyncFailure(error) error {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 
-	for _, trie := range t.triesInProgress {
+	for range t.triesInProgress {
 		// In real implementation:
 		// for _, segment := range trie.segments {
 		//     segment.batch.Write()

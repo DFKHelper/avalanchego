@@ -400,7 +400,7 @@ func (vm *VM) Initialize(
 			return errFirewoodOfflinePruningUnsupported
 		}
 		if vm.config.StateSyncEnabled == nil || *vm.config.StateSyncEnabled {
-			return errFirewoodStateSyncUnsupported
+			log.Warn("Firewood state sync enabled - using range proof sync")
 		}
 		if vm.config.PopulateMissingTries != nil {
 			return errFirewoodMissingTrieRepopulationUnsupported

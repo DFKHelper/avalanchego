@@ -96,7 +96,12 @@ func (m *mainTrieTask) OnLeafs(ctx context.Context, db ethdb.KeyValueWriter, key
 
 		// Register storage trie if account has non-empty storage root
 		if acc.Root != (common.Hash{}) && acc.Root != types.EmptyRootHash {
-			if err := m.sync.trieQueue.RegisterStorageTrie(acc.Root, accountHash); err != nil {
+			// Type assertion needed because trieQueue is interface{} to avoid import cycles
+			queue, ok := m.sync.trieQueue.(*trieQueue)
+			if !ok {
+				return fmt.Errorf("invalid trieQueue type")
+			}
+			if err := queue.RegisterStorageTrie(acc.Root, accountHash); err != nil {
 				return err
 			}
 		}

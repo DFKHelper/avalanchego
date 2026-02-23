@@ -43,19 +43,34 @@ const (
 // - ALSO flushes on periodic timer (default: 5 seconds) to prevent data loss on crash
 // - Provides read-your-writes consistency by checking pending batch first
 //
-// Key Registry: Tracks all committed keys in memory (not using Firewood's merkle iterator)
-// - Firewood's iterator returns merkle nodes, not key-value pairs
-// - Instead, we maintain a registry of all keys committed to Firewood
-// - Iterator uses this registry to fetch actual key-value pairs
+// Key Registry: Legacy tracking of committed keys (retained for health monitoring).
+// - Iterators now use Firewood's native FFI trie iterator (Revision.Iter())
+//   which reads key-value pairs directly from the persisted trie
+// - The registry is no longer required for iteration correctness
+//
+// Root Hash Tracking:
+// - Firewood's Get() uses fwd_get_latest which requires an in-memory revision.
+// - After restart, no revision exists in memory, so Get() returns nil for ALL keys.
+// - Fix: We track the current root hash and use GetFromRoot() which reads directly
+//   from the persisted trie, bypassing the revision system entirely.
+// - currentRoot is updated after every Propose+Commit under pendingMu lock.
 //
 // See ARCHITECTURE_NOTES.md for detailed design rationale.
 type Database struct {
-	fw     *ffi.Database
-	log    logging.Logger
-	closed atomic.Bool
+	fw          *ffi.Database
+	log         logging.Logger
+	dbPath      string // Path to this database (for debug logging)
+	closed      atomic.Bool
+	currentRoot ffi.Hash // Current trie root hash for GetFromRoot reads (protected by pendingMu)
+
+	// readCacheGen is incremented on every flush/commit so that an in-flight Get()
+	// that already snapshotted a (possibly stale) root can detect the flush and skip
+	// caching its result, preventing a stale entry from entering the read cache.
+	readCacheGen atomic.Uint64
 
 	// Pending batch tracking for auto-flush
-	pendingMu    sync.Mutex
+	// pendingMu is an RWMutex: reads (Get/Has/NewIterator) use RLock; writes (Put/Delete/flush) use Lock.
+	pendingMu    sync.RWMutex
 	pending      *pendingBatch // Accumulates writes until flush
 	flushSize    int           // Auto-flush threshold
 	flushOnClose bool          // Whether to flush pending writes on close
@@ -64,9 +79,18 @@ type Database struct {
 	flushTicker *time.Ticker
 	flushDone   chan struct{}
 
-	// Key registry: Track all committed keys to enable iteration without Firewood's merkle iterator
-	// Firewood's rev.Iter() returns merkle nodes (97-129 bytes), not actual keys
-	// This registry lets us iterate over actual committed keys
+	// Go-level read cache: stores recently-read committed key-value pairs in Go
+	// memory to avoid repeated FFI trie traversals for hot keys.
+	// Access is protected by readCacheMu.  The cache is cleared on every
+	// flush/batch-commit (readCacheGen is bumped at the same time).
+	// Pending-batch entries always take priority in Get/Has, so the cache can
+	// never hide an uncommitted write.
+	readCacheMu  sync.RWMutex
+	readCache    map[string][]byte
+	readCacheMax int // 0 = cache disabled
+
+	// Key registry: Legacy tracking of committed keys for health monitoring.
+	// Iterators now use Firewood's native FFI trie iterator directly.
 	registryMu        sync.RWMutex
 	registry          map[string]bool // Set of all committed keys (string key, bool always true)
 	registryFile      string          // Path to registry persistence file
@@ -129,8 +153,9 @@ func New(file string, configBytes []byte, log logging.Logger) (database.Database
 		ffi.WithReadCacheStrategy(cfg.CacheStrategy),
 	}
 
-	// Enable root store for disk persistence across restarts.
-	// Without this, all revisions are memory-only and lost on restart.
+	// Enable root store for historical revision access.
+	// Without this, old revisions are freed via the freelist and space is reused.
+	// The latest state is always persisted regardless of this setting.
 	if cfg.RootStore {
 		options = append(options, ffi.WithRootStore())
 	}
@@ -141,25 +166,55 @@ func New(file string, configBytes []byte, log logging.Logger) (database.Database
 		return nil, fmt.Errorf("failed to open firewood database: %w", err)
 	}
 
-	log.Info("Firewood database opened successfully",
-		zap.Bool("rootStore", cfg.RootStore),
-		zap.Uint("revisionsInMemory", cfg.RevisionsInMemory),
-		zap.Uint("cacheSizeBytes", cfg.CacheSizeBytes),
-	)
+	// Get initial root hash for read operations.
+	// CRITICAL: Firewood's Get() uses fwd_get_latest which needs an in-memory revision.
+	// After restart, no revision exists, so Get() returns nil for ALL keys - causing
+	// the P-Chain to think lastAcceptedHeight=0 and re-fetch everything from genesis.
+	// GetFromRoot() bypasses the revision system and reads directly from the persisted trie.
+	initialRoot, err := fw.Root()
+	if err != nil {
+		fw.Close(context.Background())
+		return nil, fmt.Errorf("failed to get initial root hash: %w", err)
+	}
+
+	if initialRoot != ffi.EmptyRoot {
+		log.Info("Firewood database opened with existing data",
+			zap.Bool("rootStore", cfg.RootStore),
+			zap.Uint("revisionsInMemory", cfg.RevisionsInMemory),
+			zap.Uint("cacheSizeBytes", cfg.CacheSizeBytes),
+			zap.String("rootHash", fmt.Sprintf("%x", initialRoot[:8])),
+		)
+	} else {
+		log.Info("Firewood database opened (empty/new instance)",
+			zap.Bool("rootStore", cfg.RootStore),
+			zap.Uint("revisionsInMemory", cfg.RevisionsInMemory),
+			zap.Uint("cacheSizeBytes", cfg.CacheSizeBytes),
+		)
+	}
 
 	flushSize := cfg.FlushSize
 	if flushSize == 0 {
 		flushSize = DefaultFlushSize
 	}
 
+	readCacheMax := cfg.ReadCacheSize
+	if readCacheMax < 0 {
+		readCacheMax = 0
+	}
+
 	db := &Database{
 		fw:           fw,
 		log:          log,
+		dbPath:       file,
+		closed:       atomic.Bool{},
+		currentRoot:  initialRoot,
 		pending:      newPendingBatch(),
 		flushSize:    flushSize,
 		flushOnClose: true,
 		flushTicker:  time.NewTicker(5 * time.Second), // Flush every 5 seconds
 		flushDone:    make(chan struct{}),
+		readCacheMax: readCacheMax,
+		readCache:    make(map[string][]byte, readCacheMax),
 		registry:     make(map[string]bool), // Initialize key registry
 	}
 
@@ -209,6 +264,13 @@ func (db *Database) flushLocked() error {
 		return fmt.Errorf("firewood commit failed: %w", err)
 	}
 
+	// Update current root hash after successful commit.
+	// This is critical: GetFromRoot reads from a specific root, so we must
+	// track the latest root to see newly committed data.
+	if newRoot, err := db.fw.Root(); err == nil {
+		db.currentRoot = newRoot
+	}
+
 	// Write-back verification: spot-check that committed data is readable
 	// This catches Firewood FFI bugs where Propose+Commit succeeds but data is lost
 	verifyCount := 0
@@ -216,7 +278,7 @@ func (db *Database) flushLocked() error {
 		if op.delete || verifyCount >= 3 {
 			break
 		}
-		readBack, err := db.fw.Get(op.key)
+		readBack, err := db.fw.GetFromRoot(db.currentRoot, op.key)
 		if err != nil || readBack == nil {
 			db.log.Error("WRITE-BACK VERIFICATION FAILED: committed key not readable",
 				zap.Int("keyLen", len(op.key)),
@@ -230,28 +292,28 @@ func (db *Database) flushLocked() error {
 			if retryErr = retryProposal.Commit(); retryErr != nil {
 				return fmt.Errorf("firewood retry commit failed after verification failure: %w", retryErr)
 			}
+			if newRoot, err := db.fw.Root(); err == nil {
+				db.currentRoot = newRoot
+			}
 			db.log.Warn("Firewood write-back verification: retry commit succeeded")
 			break
 		}
 		verifyCount++
 	}
 
-	// Update key registry with committed keys
-	// This enables iteration without relying on Firewood's merkle iterator
-	db.registryMu.Lock()
-	for _, op := range db.pending.ops {
-		if op.delete {
-			delete(db.registry, string(op.key))
-		} else {
-			db.registry[string(op.key)] = true
-		}
-	}
-	db.registryMu.Unlock()
+	// Registry updates DISABLED: iterators now use native FFI trie iterator
+	// (Revision.Iter()) which reads key-value pairs directly from the persisted trie.
+	// The registry was causing severe performance degradation during bootstrap execution
+	// by growing to millions of keys and blocking all DB operations during JSON serialization.
 
-	// Persist registry to disk (rate-limited to every 5 minutes)
-	if err := db.saveRegistryIfNeeded(); err != nil {
-		db.log.Warn("Failed to save registry to disk", zap.Error(err))
-		// Non-fatal: continue execution, registry will be saved on next flush
+	// Clear read cache: the trie root changed so all cached values are stale.
+	// Bump the generation counter first so in-flight Gets that already snapshotted
+	// the old root will notice the change and skip caching their (stale) results.
+	if db.readCacheMax > 0 {
+		db.readCacheGen.Add(1)
+		db.readCacheMu.Lock()
+		clear(db.readCache)
+		db.readCacheMu.Unlock()
 	}
 
 	// Clear pending batch
@@ -643,52 +705,103 @@ func (db *Database) Has(key []byte) (bool, error) {
 		return false, database.ErrClosed
 	}
 
-	db.pendingMu.Lock()
-	defer db.pendingMu.Unlock()
+	// Read pending batch and snapshot root under read lock (non-blocking for concurrent Gets).
+	db.pendingMu.RLock()
+	op, inPending := db.pending.ops[string(key)]
+	root := db.currentRoot
+	db.pendingMu.RUnlock()
 
-	// Check pending batch first
-	if op, exists := db.pending.ops[string(key)]; exists {
-		return !op.delete, nil // exists if not a delete operation
+	// Check pending batch first (read-your-writes for uncommitted ops).
+	if inPending {
+		return !op.delete, nil
 	}
 
-	// Check committed state in Firewood
-	val, err := db.fw.Get(key)
+	// Check committed state using root hash (works after restart).
+	// Lock is released so concurrent Has/Get/FFI calls can proceed in parallel.
+	val, err := db.fw.GetFromRoot(root, key)
 	if err != nil {
 		return false, err
 	}
 
-	// Firewood Get() returns nil for missing keys (not an error)
+	// GetFromRoot returns nil for missing keys (not an error)
 	return val != nil, nil
 }
 
 // Get implements database.KeyValueReader
 // Provides read-your-writes consistency by checking pending batch first.
+//
+// Hot path: pending → read cache → FFI trie traversal.
+// The pending check and root snapshot require only a brief read lock.
+// The read cache and FFI call are performed without holding any lock, allowing
+// true parallelism for concurrent Gets on the same database instance.
 func (db *Database) Get(key []byte) ([]byte, error) {
 	if db.closed.Load() {
 		return nil, database.ErrClosed
 	}
 
-	db.pendingMu.Lock()
-	defer db.pendingMu.Unlock()
+	keyStr := string(key)
 
-	// Check pending batch first (read-your-writes consistency)
-	if op, exists := db.pending.ops[string(key)]; exists {
+	// Phase 1: check pending batch and snapshot root under a brief read lock.
+	// This is the only phase that requires synchronization with writers.
+	db.pendingMu.RLock()
+	op, inPending := db.pending.ops[keyStr]
+	root := db.currentRoot
+	db.pendingMu.RUnlock()
+
+	if inPending {
 		if op.delete {
 			return nil, database.ErrNotFound // Pending delete
 		}
-		// Return copy to prevent caller from modifying pending batch
+		// Return copy to prevent caller from modifying pending batch.
 		result := make([]byte, len(op.value))
 		copy(result, op.value)
 		return result, nil
 	}
 
-	// Check committed state in Firewood
-	value, err := db.fw.Get(key)
+	// Phase 2: check the Go-level read cache (no FFI, no trie traversal).
+	// Snapshot the cache generation before the lookup so we can safely skip
+	// caching the FFI result if a flush raced between Phase 2 and Phase 3.
+	var genBefore uint64
+	if db.readCacheMax > 0 {
+		db.readCacheMu.RLock()
+		cached, inCache := db.readCache[keyStr]
+		genBefore = db.readCacheGen.Load()
+		db.readCacheMu.RUnlock()
+		if inCache {
+			if cached == nil {
+				return nil, database.ErrNotFound
+			}
+			result := make([]byte, len(cached))
+			copy(result, cached)
+			return result, nil
+		}
+	}
+
+	// Phase 3: FFI trie traversal — no locks held, true parallel reads.
+	value, err := db.fw.GetFromRoot(root, key)
 	if err != nil {
 		return nil, err
 	}
 
-	// Firewood Get() returns nil for missing keys (not an error)
+	// Populate read cache so the next Get of this key skips the FFI call.
+	// Skip if the cache generation changed (a flush occurred while we were in
+	// the FFI call), because our result is based on a now-superseded root.
+	if db.readCacheMax > 0 && db.readCacheGen.Load() == genBefore {
+		db.readCacheMu.Lock()
+		// Re-check generation and capacity under write lock.
+		if db.readCacheGen.Load() == genBefore && len(db.readCache) < db.readCacheMax {
+			if value != nil {
+				valCopy := make([]byte, len(value))
+				copy(valCopy, value)
+				db.readCache[keyStr] = valCopy
+			}
+			// We intentionally do NOT cache nil (missing key) to avoid
+			// returning a stale "not found" after a concurrent Put+flush.
+		}
+		db.readCacheMu.Unlock()
+	}
+
+	// GetFromRoot returns nil for missing keys (not an error)
 	if value == nil {
 		return nil, database.ErrNotFound
 	}
@@ -722,6 +835,14 @@ func (db *Database) Put(key []byte, value []byte) error {
 		delete: false,
 	}
 
+	// Evict from read cache so a subsequent Get sees the pending value, not
+	// the previously cached committed value.
+	if db.readCacheMax > 0 {
+		db.readCacheMu.Lock()
+		delete(db.readCache, string(keyCopy))
+		db.readCacheMu.Unlock()
+	}
+
 	// Auto-flush if threshold reached
 	if len(db.pending.ops) >= db.flushSize {
 		return db.flushLocked()
@@ -749,6 +870,13 @@ func (db *Database) Delete(key []byte) error {
 		key:    keyCopy,
 		value:  nil,
 		delete: true,
+	}
+
+	// Evict from read cache so a subsequent Get sees the pending delete.
+	if db.readCacheMax > 0 {
+		db.readCacheMu.Lock()
+		delete(db.readCache, string(keyCopy))
+		db.readCacheMu.Unlock()
 	}
 
 	// Auto-flush if threshold reached
@@ -803,20 +931,17 @@ func (db *Database) preparePendingOpsLocked(start, prefix []byte) []pendingKV {
 }
 
 // NewIterator implements database.Iteratee
-// Returns registry-based iterator combining committed + pending operations
+// Returns native FFI trie iterator merging committed + pending operations
 func (db *Database) NewIterator() database.Iterator {
 	if db.closed.Load() {
 		return newErrorIterator(database.ErrClosed)
 	}
 
-	db.pendingMu.Lock()
-	defer db.pendingMu.Unlock()
+	db.pendingMu.RLock()
+	defer db.pendingMu.RUnlock()
 
-	// Prepare pending operations
 	pending := db.preparePendingOpsLocked(nil, nil)
-
-	// Create registry-based iterator (no Firewood FFI iterator needed)
-	return newIterator(db, pending, nil, nil, db.log)
+	return newNativeIterator(db.fw, db.currentRoot, pending, nil, nil)
 }
 
 // NewIteratorWithStart implements database.Iteratee
@@ -825,14 +950,11 @@ func (db *Database) NewIteratorWithStart(start []byte) database.Iterator {
 		return newErrorIterator(database.ErrClosed)
 	}
 
-	db.pendingMu.Lock()
-	defer db.pendingMu.Unlock()
+	db.pendingMu.RLock()
+	defer db.pendingMu.RUnlock()
 
-	// Prepare pending operations (filtered by start)
 	pending := db.preparePendingOpsLocked(start, nil)
-
-	// Create registry-based iterator with start filter
-	return newIterator(db, pending, start, nil, db.log)
+	return newNativeIterator(db.fw, db.currentRoot, pending, start, nil)
 }
 
 // NewIteratorWithPrefix implements database.Iteratee
@@ -841,14 +963,11 @@ func (db *Database) NewIteratorWithPrefix(prefix []byte) database.Iterator {
 		return newErrorIterator(database.ErrClosed)
 	}
 
-	db.pendingMu.Lock()
-	defer db.pendingMu.Unlock()
+	db.pendingMu.RLock()
+	defer db.pendingMu.RUnlock()
 
-	// Prepare pending operations (filtered by prefix)
 	pending := db.preparePendingOpsLocked(nil, prefix)
-
-	// Create registry-based iterator with prefix filter
-	return newIterator(db, pending, nil, prefix, db.log)
+	return newNativeIterator(db.fw, db.currentRoot, pending, nil, prefix)
 }
 
 // NewIteratorWithStartAndPrefix implements database.Iteratee
@@ -857,14 +976,11 @@ func (db *Database) NewIteratorWithStartAndPrefix(start, prefix []byte) database
 		return newErrorIterator(database.ErrClosed)
 	}
 
-	db.pendingMu.Lock()
-	defer db.pendingMu.Unlock()
+	db.pendingMu.RLock()
+	defer db.pendingMu.RUnlock()
 
-	// Prepare pending operations (filtered by both start and prefix)
 	pending := db.preparePendingOpsLocked(start, prefix)
-
-	// Create registry-based iterator with both start and prefix filters
-	return newIterator(db, pending, start, prefix, db.log)
+	return newNativeIterator(db.fw, db.currentRoot, pending, start, prefix)
 }
 
 // Compact implements database.Compacter
@@ -996,9 +1112,9 @@ func (db *Database) HealthCheck(ctx context.Context) (interface{}, error) {
 		return nil, database.ErrClosed
 	}
 
-	db.pendingMu.Lock()
+	db.pendingMu.RLock()
 	pendingOps := len(db.pending.ops)
-	db.pendingMu.Unlock()
+	db.pendingMu.RUnlock()
 
 	db.registryMu.RLock()
 	registrySize := len(db.registry)
@@ -1021,10 +1137,15 @@ func (db *Database) HealthCheck(ctx context.Context) (interface{}, error) {
 	}
 
 	// Try a simple read operation to verify database is responsive
+	// Use GetFromRoot to work correctly after restart (no revision needed)
 	testKey := []byte("__health_check__")
-	_, err := db.fw.Get(testKey)
+	root, err := db.fw.Root()
 	if err != nil {
-		return nil, fmt.Errorf("health check failed: %w", err)
+		return nil, fmt.Errorf("health check failed (root hash): %w", err)
+	}
+	_, err = db.fw.GetFromRoot(root, testKey)
+	if err != nil {
+		return nil, fmt.Errorf("health check failed (read): %w", err)
 	}
 
 	return map[string]interface{}{
@@ -1122,13 +1243,26 @@ func (b *batch) Write() error {
 		return fmt.Errorf("firewood batch commit failed: %w", err)
 	}
 
+	// Update current root hash after successful commit
+	if newRoot, err := b.db.fw.Root(); err == nil {
+		b.db.currentRoot = newRoot
+	}
+
+	// Clear read cache: trie root changed so all previously cached values are stale.
+	if b.db.readCacheMax > 0 {
+		b.db.readCacheGen.Add(1)
+		b.db.readCacheMu.Lock()
+		clear(b.db.readCache)
+		b.db.readCacheMu.Unlock()
+	}
+
 	// Write-back verification: spot-check that batch data is readable after commit
 	verifyCount := 0
 	for _, op := range b.ops {
 		if op.delete || verifyCount >= 3 {
 			break
 		}
-		readBack, err := b.db.fw.Get(op.key)
+		readBack, err := b.db.fw.GetFromRoot(b.db.currentRoot, op.key)
 		if err != nil || readBack == nil {
 			b.db.log.Error("BATCH WRITE-BACK VERIFICATION FAILED: committed key not readable",
 				zap.Int("keyLen", len(op.key)),
@@ -1143,6 +1277,9 @@ func (b *batch) Write() error {
 			if retryErr = retryProposal.Commit(); retryErr != nil {
 				return fmt.Errorf("firewood batch retry commit failed: %w", retryErr)
 			}
+			if newRoot, err := b.db.fw.Root(); err == nil {
+				b.db.currentRoot = newRoot
+			}
 			b.db.log.Warn("Firewood batch write-back verification: retry commit succeeded",
 				zap.Int("batchSize", len(b.ops)),
 			)
@@ -1151,22 +1288,9 @@ func (b *batch) Write() error {
 		verifyCount++
 	}
 
-	// Update key registry with committed keys (CRITICAL: blocks won't be iterable without this)
-	b.db.registryMu.Lock()
-	for _, op := range b.ops {
-		if op.delete {
-			delete(b.db.registry, string(op.key))
-		} else {
-			b.db.registry[string(op.key)] = true
-		}
-	}
-	b.db.registryMu.Unlock()
-
-	// Persist registry to disk (rate-limited to every 5 minutes)
-	if err := b.db.saveRegistryIfNeeded(); err != nil {
-		b.db.log.Warn("Failed to save registry to disk after batch write", zap.Error(err))
-		// Non-fatal: continue execution, registry will be saved on next attempt
-	}
+	// Registry updates DISABLED: iterators use native FFI trie iterator.
+	// The previous comment "CRITICAL: blocks won't be iterable without this" was outdated.
+	// Native iterators (Revision.Iter()) read directly from the persisted trie.
 
 	b.db.log.Debug("Batch write committed", zap.Int("keysWritten", len(b.ops)))
 

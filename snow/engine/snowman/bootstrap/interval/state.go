@@ -16,14 +16,16 @@ const (
 	intervalPrefixByte byte = iota
 	blockPrefixByte
 	checkpointPrefixByte
+	executeCheckpointPrefixByte
 
 	prefixLen = 1
 )
 
 var (
-	intervalPrefix   = []byte{intervalPrefixByte}
-	blockPrefix      = []byte{blockPrefixByte}
-	checkpointPrefix = []byte{checkpointPrefixByte}
+	intervalPrefix          = []byte{intervalPrefixByte}
+	blockPrefix             = []byte{blockPrefixByte}
+	checkpointPrefix        = []byte{checkpointPrefixByte}
+	executeCheckpointPrefix = []byte{executeCheckpointPrefixByte}
 
 	errInvalidKeyLength = errors.New("invalid key length")
 )
@@ -37,6 +39,18 @@ type FetchCheckpoint struct {
 	Timestamp           time.Time      `json:"timestamp"`
 	MissingBlockIDCount int            `json:"missingBlockIDCount"`
 	ETASamples          []timer.Sample `json:"etaSamples"`
+}
+
+// ExecuteCheckpoint stores bootstrap EXECUTE phase progress
+// This checkpoint is created periodically during block execution to prevent
+// progress loss if the node crashes during the long execution phase
+type ExecuteCheckpoint struct {
+	NumExecuted        uint64         `json:"numExecuted"`        // Blocks executed so far
+	TotalToExecute     uint64         `json:"totalToExecute"`     // Total blocks to execute
+	LastAcceptedHeight uint64         `json:"lastAcceptedHeight"` // Height of last accepted block
+	StartingHeight     uint64         `json:"startingHeight"`     // Starting height (for validation)
+	Timestamp          time.Time      `json:"timestamp"`          // Checkpoint creation time
+	ETASamples         []timer.Sample `json:"etaSamples"`         // ETA tracker samples
 }
 
 func GetIntervals(db database.Iteratee) ([]*Interval, error) {
@@ -156,4 +170,38 @@ func PutFetchCheckpoint(db database.KeyValueWriter, checkpoint *FetchCheckpoint)
 // DeleteFetchCheckpoint removes the checkpoint from the database
 func DeleteFetchCheckpoint(db database.KeyValueDeleter) error {
 	return db.Delete(checkpointPrefix)
+}
+
+// GetExecuteCheckpoint retrieves the saved execute checkpoint from the database
+func GetExecuteCheckpoint(db database.KeyValueReader) (*ExecuteCheckpoint, error) {
+	data, err := db.Get(executeCheckpointPrefix)
+	if err != nil {
+		if err == database.ErrNotFound {
+			// Checkpoint doesn't exist, return nil without error
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var checkpoint ExecuteCheckpoint
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		return nil, err
+	}
+
+	return &checkpoint, nil
+}
+
+// PutExecuteCheckpoint saves an execute checkpoint to the database
+func PutExecuteCheckpoint(db database.KeyValueWriter, checkpoint *ExecuteCheckpoint) error {
+	data, err := json.Marshal(checkpoint)
+	if err != nil {
+		return err
+	}
+
+	return db.Put(executeCheckpointPrefix, data)
+}
+
+// DeleteExecuteCheckpoint removes the execute checkpoint from the database
+func DeleteExecuteCheckpoint(db database.KeyValueDeleter) error {
+	return db.Delete(executeCheckpointPrefix)
 }

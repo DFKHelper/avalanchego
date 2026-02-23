@@ -34,6 +34,7 @@ import (
 	"github.com/ava-labs/avalanchego/database/firewood"
 	"github.com/ava-labs/avalanchego/database/leveldb"
 	"github.com/ava-labs/avalanchego/utils/logging"
+	"go.uber.org/zap"
 )
 
 func main() {
@@ -84,20 +85,20 @@ func main() {
 	}()
 
 	// Open source database (LevelDB)
-	log.Info("opening source database", "path", *sourcePath)
+	log.Info("opening source database", zap.String("path", *sourcePath))
 	sourceDB, err := leveldb.New(*sourcePath, nil, log, nil)
 	if err != nil {
-		log.Fatal("failed to open source database", "error", err)
+		log.Fatal("failed to open source database", zap.Error(err))
 		os.Exit(1)
 	}
 	defer sourceDB.Close()
 
 	// Estimate migration time if requested
 	if *estimate {
-		log.Info("estimating migration time", "sampleSize", *sampleSize)
+		log.Info("estimating migration time", zap.Int("sampleSize", *sampleSize))
 		keys, bytes, duration, err := firewood.EstimateMigrationTime(ctx, sourceDB, *sampleSize, log)
 		if err != nil {
-			log.Fatal("estimation failed", "error", err)
+			log.Fatal("estimation failed", zap.Error(err))
 			os.Exit(1)
 		}
 
@@ -114,7 +115,7 @@ func main() {
 	// Open destination database (Firewood)
 	// TODO: Uncomment when Firewood fork is ready
 	log.Warn("Firewood migration tool is placeholder - awaiting fork with iterator support")
-	log.Info("would open destination database", "path", *destPath)
+	log.Info("would open destination database", zap.String("path", *destPath))
 
 	// destDB, err := firewood.New(*destPath, nil, log)
 	// if err != nil {
@@ -129,8 +130,8 @@ func main() {
 	config.VerifyAfterMigration = *verify
 
 	log.Info("migration configuration",
-		"batchSize", config.BatchSize,
-		"verify", config.VerifyAfterMigration,
+		zap.Int("batchSize", config.BatchSize),
+		zap.Bool("verify", config.VerifyAfterMigration),
 	)
 
 	// Perform migration

@@ -275,6 +275,7 @@ func TestExecute(t *testing.T) {
 				parser,
 				tree,
 				test.lastAcceptedHeight,
+				nil, // onCheckpoint callback not needed for tests
 			))
 			for _, height := range test.expectedProcessingHeights {
 				require.Equal(snowtest.Undecided, blocks[height].Status)

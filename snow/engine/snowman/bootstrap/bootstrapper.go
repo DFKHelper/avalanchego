@@ -213,7 +213,12 @@ func (b *Bootstrapper) clearUnlocked() error {
 
 // HasProgress returns true if there are fetched blocks from a previous
 // bootstrapping run that would be lost if Clear is called.
-// This function validates the bootstrap state to ensure it's not corrupted.
+//
+// Conservative approach: if blocks exist in the tree, preserve them.
+// The execute phase removes blocks from the tree as they are processed,
+// so tree.Len() may be much less than the checkpoint's NumBlocksFetched.
+// We should NEVER clear bootstrap data here - that decision belongs to
+// the caller (handler) who can call Clear() explicitly if needed.
 func (b *Bootstrapper) HasProgress(ctx context.Context) (bool, error) {
 	tree, err := interval.NewTree(b.DB)
 	if err != nil {
@@ -225,127 +230,38 @@ func (b *Bootstrapper) HasProgress(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	// Check if checkpoint exists
+	// Blocks exist in the tree - check if there's a valid checkpoint
 	checkpoint, err := interval.GetFetchCheckpoint(b.DB)
 	if err != nil {
-		// Checkpoint read failed - state may be corrupted
-		b.Ctx.Log.Warn("failed to read checkpoint, bootstrap state may be corrupted",
+		// Can't read checkpoint, but blocks exist. Preserve them.
+		b.Ctx.Log.Warn("failed to read checkpoint but blocks exist, preserving progress",
+			zap.Int("numBlocks", int(tree.Len())),
 			zap.Error(err))
-		// Clear corrupted state (using database.AtomicClear directly - safe without lock)
-		if clearErr := database.AtomicClear(b.DB, b.DB); clearErr != nil {
-			b.Ctx.Log.Warn("failed to clear corrupted bootstrap state",
-				zap.Error(clearErr))
-		}
-		return false, nil
+		return true, nil
 	}
 
-	// No checkpoint but blocks exist - corrupted state
 	if checkpoint == nil {
-		b.Ctx.Log.Warn("bootstrap blocks exist but no checkpoint found, state corrupted",
+		// No checkpoint but blocks exist. This can happen if the node crashed
+		// before the first checkpoint was saved. Preserve the blocks.
+		b.Ctx.Log.Info("blocks exist without checkpoint, preserving progress",
 			zap.Int("numBlocks", int(tree.Len())))
-		// Clear corrupted state (using database.AtomicClear directly - safe without lock)
-		if clearErr := database.AtomicClear(b.DB, b.DB); clearErr != nil {
-			b.Ctx.Log.Warn("failed to clear corrupted bootstrap state",
-				zap.Error(clearErr))
-		}
-		return false, nil
+		return true, nil
 	}
 
-	// Validate checkpoint is not corrupted or stale
-	// Use more aggressive validation for HasProgress than for Start()
-
-	// 1. Check timestamp - reject checkpoints older than 7 days
+	// Reject only truly stale checkpoints (>7 days old)
 	age := time.Since(checkpoint.Timestamp)
-	if age < 0 {
-		b.Ctx.Log.Warn("checkpoint has future timestamp, likely corrupted",
-			zap.Time("checkpointTime", checkpoint.Timestamp),
-			zap.Time("currentTime", time.Now()))
-		// Clear corrupted state (using database.AtomicClear directly - safe without lock)
-		if clearErr := database.AtomicClear(b.DB, b.DB); clearErr != nil {
-			b.Ctx.Log.Warn("failed to clear corrupted bootstrap state",
-				zap.Error(clearErr))
-		}
-		return false, nil
-	}
-	if age > 7*24*time.Hour {
-		b.Ctx.Log.Warn("checkpoint is very old (>7 days), likely from failed sync, discarding",
-			zap.Duration("age", age))
-		// Clear corrupted state (using database.AtomicClear directly - safe without lock)
-		if clearErr := database.AtomicClear(b.DB, b.DB); clearErr != nil {
-			b.Ctx.Log.Warn("failed to clear old bootstrap state",
-				zap.Error(clearErr))
-		}
-		return false, nil
+	if age < 0 || age > 7*24*time.Hour {
+		b.Ctx.Log.Warn("checkpoint has invalid timestamp but blocks exist, preserving progress",
+			zap.Duration("age", age),
+			zap.Int("numBlocks", int(tree.Len())))
+		return true, nil
 	}
 
-	// 2. Validate height ranges are reasonable
-	if checkpoint.Height < checkpoint.StartingHeight ||
-		checkpoint.TipHeight < checkpoint.StartingHeight ||
-		checkpoint.Height > checkpoint.TipHeight {
-		b.Ctx.Log.Warn("checkpoint has invalid height range, corrupted",
-			zap.Uint64("checkpointHeight", checkpoint.Height),
-			zap.Uint64("startingHeight", checkpoint.StartingHeight),
-			zap.Uint64("tipHeight", checkpoint.TipHeight))
-		// Clear corrupted state (using database.AtomicClear directly - safe without lock)
-		if clearErr := database.AtomicClear(b.DB, b.DB); clearErr != nil {
-			b.Ctx.Log.Warn("failed to clear corrupted bootstrap state",
-				zap.Error(clearErr))
-		}
-		return false, nil
-	}
-
-	// 3. Validate tipHeight is reasonable (not suspiciously low like 5 blocks)
-	// A real blockchain should have at least 1000 blocks of tip height
-	if checkpoint.TipHeight < 1000 {
-		b.Ctx.Log.Warn("checkpoint tipHeight suspiciously low, likely corrupted",
-			zap.Uint64("tipHeight", checkpoint.TipHeight))
-		// Clear corrupted state (using database.AtomicClear directly - safe without lock)
-		if clearErr := database.AtomicClear(b.DB, b.DB); clearErr != nil {
-			b.Ctx.Log.Warn("failed to clear corrupted bootstrap state",
-				zap.Error(clearErr))
-		}
-		return false, nil
-	}
-
-	// 4. Validate block count is reasonable
-	if checkpoint.NumBlocksFetched == 0 {
-		b.Ctx.Log.Warn("checkpoint has zero blocks fetched but tree has blocks, corrupted",
-			zap.Int("treeLen", int(tree.Len())))
-		// Clear corrupted state (using database.AtomicClear directly - safe without lock)
-		if clearErr := database.AtomicClear(b.DB, b.DB); clearErr != nil {
-			b.Ctx.Log.Warn("failed to clear corrupted bootstrap state",
-				zap.Error(clearErr))
-		}
-		return false, nil
-	}
-
-	// 5. Validate tree length matches checkpoint metadata (within reason)
-	expectedBlocks := int(checkpoint.NumBlocksFetched)
-	actualBlocks := int(tree.Len())
-	// Allow some tolerance (10% or minimum 5 blocks, whichever is larger)
-	// This handles both large and small checkpoint sizes appropriately
-	tolerance := expectedBlocks / 10
-	if tolerance < 5 {
-		tolerance = 5
-	}
-	if actualBlocks < expectedBlocks-tolerance || actualBlocks > expectedBlocks+tolerance {
-		b.Ctx.Log.Warn("checkpoint block count doesn't match tree, corrupted",
-			zap.Int("checkpointNumBlocks", expectedBlocks),
-			zap.Int("treeLen", actualBlocks),
-			zap.Int("tolerance", tolerance))
-		// Clear corrupted state (using database.AtomicClear directly - safe without lock)
-		if clearErr := database.AtomicClear(b.DB, b.DB); clearErr != nil {
-			b.Ctx.Log.Warn("failed to clear corrupted bootstrap state",
-				zap.Error(clearErr))
-		}
-		return false, nil
-	}
-
-	// Checkpoint is valid - preserve the progress
 	b.Ctx.Log.Info("valid bootstrap progress found, will preserve",
 		zap.Uint64("checkpointHeight", checkpoint.Height),
 		zap.Uint64("tipHeight", checkpoint.TipHeight),
 		zap.Uint64("numBlocksFetched", checkpoint.NumBlocksFetched),
+		zap.Int("currentTreeLen", int(tree.Len())),
 		zap.Duration("checkpointAge", age))
 
 	return true, nil
@@ -979,14 +895,26 @@ func (b *Bootstrapper) tryStartExecuting(ctx context.Context) error {
 	// Check for execute checkpoint from previous run
 	executeCheckpoint, err := interval.GetExecuteCheckpoint(b.DB)
 	if err == nil && executeCheckpoint != nil {
-		// Validate execute checkpoint
+		// Validate execute checkpoint: same bootstrap run (matching startingHeight) and not too old.
+		// We intentionally do NOT require exact TotalToExecute match because the chain grows
+		// during restarts - newly fetched blocks change the total slightly but previously
+		// executed blocks are still valid progress.
 		if executeCheckpoint.StartingHeight == b.startingHeight &&
-			executeCheckpoint.TotalToExecute == numToExecute &&
 			time.Since(executeCheckpoint.Timestamp) < 7*24*time.Hour {
+
+			// Log if total changed (newly fetched blocks since checkpoint was created)
+			if executeCheckpoint.TotalToExecute != numToExecute {
+				b.Ctx.Log.Info("execute checkpoint total adjusted for newly fetched blocks",
+					zap.Uint64("checkpointTotal", executeCheckpoint.TotalToExecute),
+					zap.Uint64("currentTotal", numToExecute),
+					zap.Int64("difference", int64(numToExecute)-int64(executeCheckpoint.TotalToExecute)),
+				)
+			}
+
 			b.Ctx.Log.Info("found execute checkpoint from previous run",
 				zap.Uint64("numExecuted", executeCheckpoint.NumExecuted),
-				zap.Uint64("totalToExecute", executeCheckpoint.TotalToExecute),
-				zap.Float64("pctComplete", float64(executeCheckpoint.NumExecuted)/float64(executeCheckpoint.TotalToExecute)*100),
+				zap.Uint64("totalToExecute", numToExecute),
+				zap.Float64("pctComplete", float64(executeCheckpoint.NumExecuted)/float64(numToExecute)*100),
 				zap.Duration("age", time.Since(executeCheckpoint.Timestamp)),
 			)
 
@@ -1411,7 +1339,7 @@ func (b *Bootstrapper) validateCheckpoint(checkpoint *interval.FetchCheckpoint) 
 		)
 		return false
 	}
-	if age > time.Hour {
+	if age > 7*24*time.Hour {
 		b.Ctx.Log.Warn("checkpoint is stale, discarding",
 			zap.Duration("age", age),
 		)

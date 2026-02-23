@@ -5,18 +5,25 @@ package atomic
 
 import "github.com/ava-labs/avalanchego/database"
 
-// WriteAll writes all of the batches to the underlying database of baseBatch.
-// Assumes all batches have the same underlying database.
+// WriteAll writes baseBatch and each additional batch to their respective
+// underlying databases. Each batch is written independently to ensure data
+// goes to the correct database when per-chain databases are enabled.
+//
+// Previously, all batches were replayed onto baseBatch and written as one
+// atomic operation. This assumed all batches shared the same underlying
+// database. With per-chain databases (e.g., Firewood), VM batches target a
+// different database than shared memory, so replaying them onto baseBatch
+// would write VM data to the wrong database.
 func WriteAll(baseBatch database.Batch, batches ...database.Batch) error {
-	baseBatch = baseBatch.Inner()
-	// Replay the inner batches onto [baseBatch] so that it includes all DB
-	// operations as they would be applied to the base database.
+	// Write the base batch (e.g., shared memory operations) to its database.
+	if err := baseBatch.Inner().Write(); err != nil {
+		return err
+	}
+	// Write each additional batch to its own underlying database.
 	for _, batch := range batches {
-		batch = batch.Inner()
-		if err := batch.Replay(baseBatch); err != nil {
+		if err := batch.Inner().Write(); err != nil {
 			return err
 		}
 	}
-	// Write all of the combined operations in one atomic batch.
-	return baseBatch.Write()
+	return nil
 }

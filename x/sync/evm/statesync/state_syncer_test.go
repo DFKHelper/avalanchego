@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/ethdb"
 )
 
 // Mock database for testing
@@ -19,14 +20,27 @@ func (m *mockDB) Get(key []byte) ([]byte, error)              { return nil, nil 
 func (m *mockDB) Has(key []byte) (bool, error)                { return false, nil }
 func (m *mockDB) Put(key []byte, value []byte) error          { return nil }
 func (m *mockDB) Delete(key []byte) error                     { return nil }
-func (m *mockDB) NewBatch() interface{}                       { return nil }
-func (m *mockDB) NewBatchWithSize(size int) interface{}       { return nil }
-func (m *mockDB) NewIterator(prefix []byte, start []byte) interface{} { return nil }
+func (m *mockDB) NewBatch() ethdb.Batch                       { return nil }
+func (m *mockDB) NewBatchWithSize(size int) ethdb.Batch       { return nil }
+func (m *mockDB) NewIterator(prefix []byte, start []byte) ethdb.Iterator { return nil }
 func (m *mockDB) Stat(property string) (string, error)        { return "", nil }
 func (m *mockDB) Compact(start []byte, limit []byte) error    { return nil }
 func (m *mockDB) Close() error                                { return nil }
 func (m *mockDB) HealthCheck(ctx context.Context) (interface{}, error) { return nil, nil }
 func (m *mockDB) Ancient(kind string, number uint64) ([]byte, error) { return nil, nil }
+func (m *mockDB) Ancients() (uint64, error) { return 0, nil }
+func (m *mockDB) HasAncient(kind string, number uint64) (bool, error) { return false, nil }
+func (m *mockDB) AncientDatadir() (string, error) { return "", nil }
+func (m *mockDB) AncientRange(kind string, start, count, maxBytes uint64) ([][]byte, error) { return nil, nil }
+func (m *mockDB) AncientSize(kind string) (uint64, error) { return 0, nil }
+func (m *mockDB) Tail() (uint64, error) { return 0, nil }
+func (m *mockDB) ReadAncients(fn func(ethdb.AncientReaderOp) error) (err error) { return nil }
+func (m *mockDB) ModifyAncients(func(ethdb.AncientWriteOp) error) (int64, error) { return 0, nil }
+func (m *mockDB) TruncateHead(n uint64) (uint64, error) { return 0, nil }
+func (m *mockDB) TruncateTail(n uint64) (uint64, error) { return 0, nil }
+func (m *mockDB) Sync() error { return nil }
+func (m *mockDB) MigrateTable(string, func([]byte) ([]byte, error)) error { return nil }
+func (m *mockDB) NewSnapshot() (ethdb.Snapshot, error) { return nil, nil }
 
 // Mock code syncer
 type mockCodeSyncer struct {
