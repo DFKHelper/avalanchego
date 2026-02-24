@@ -49,7 +49,7 @@ readonly NODE_API="http://localhost:9650"
 # Thresholds
 readonly MAX_STATE_SYNC_RETRIES=3      # Switch to block sync after this many failures
 readonly MAX_CORRUPTION_RETRIES=2      # Wipe + resync after this many corruption restarts
-readonly STALL_TIMEOUT_MINUTES=90      # Progress must change within this window (large tries need 40-60min each)
+readonly STALL_TIMEOUT_MINUTES=20      # Progress must change within this window; leaf-count bypasses this for large tries
 readonly STALL_CHECKS_BEFORE_ACTION=3  # Consecutive stall checks required before restart
 readonly API_FAIL_THRESHOLD=3          # Consecutive API failures before restart
 readonly PEER_FAIL_THRESHOLD=5         # Consecutive 0-peer checks (5 min) before restart
