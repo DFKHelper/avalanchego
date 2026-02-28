@@ -302,6 +302,18 @@ check_dfk_errors() {
 check_dfk_progress() {
     local now; now=$(date '+%s') || return 0
 
+    # While P-chain is still bootstrapping, DFK chain cannot start at all.
+    # Any DFK silence during this period is expected — reset the stall timer
+    # so we don't fire false stall incidents while waiting for P-chain.
+    local pchain_done
+    pchain_done=$(curl -sf --max-time 3 "http://localhost:9650/ext/metrics" 2>/dev/null \
+        | grep 'avalanche_snowman_bootstrap_finished{chain="P"}' \
+        | awk '{print $2}' | head -1 | cut -d'.' -f1) || true
+    if [[ "${pchain_done:-0}" == "0" ]]; then
+        state_set "dfk_progress_time" "${now}"
+        return 0  # P-chain still bootstrapping — DFK can't run, not a real stall
+    fi
+
     local current=""
     if [[ -f "${DFK_LOG}" ]]; then
         # 1. Block fetch count from "fetching blocks" log entries — HIGHEST PRIORITY.
