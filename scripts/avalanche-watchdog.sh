@@ -304,13 +304,26 @@ check_dfk_progress() {
 
     local current=""
     if [[ -f "${DFK_LOG}" ]]; then
-        # 1. Checkpoint height — best indicator during block execution phase (changes every few min)
-        local chkpt_height
-        chkpt_height=$(tail -100 "${DFK_LOG}" 2>/dev/null \
-            | grep -oP '"height":\s*\K[0-9]+' 2>/dev/null | tail -1) || true
-        [[ -n "${chkpt_height}" ]] && [[ "${chkpt_height}" != "0" ]] && current="chkpt:${chkpt_height}"
+        # 1. Block fetch count from "fetching blocks" log entries — HIGHEST PRIORITY.
+        #    These appear every ~18s during the long block-download phase and are the
+        #    only reliable liveness signal. Must come before checkpoint height because
+        #    checkpoint height only changes in rapid bursts at startup, then stays static
+        #    for hours while the node is actively downloading — causing false stall fires.
+        local fetched
+        fetched=$(tail -100 "${DFK_LOG}" 2>/dev/null \
+            | grep '"numFetchedBlocks"' 2>/dev/null \
+            | grep -oP '"numFetchedBlocks":\s*\K[0-9]+' 2>/dev/null | tail -1) || true
+        [[ -n "${fetched}" ]] && current="fetched:${fetched}"
 
-        # 2. State sync: triesRemaining
+        # 2. Checkpoint height — indicator during block execution bursts
+        if [[ -z "${current}" ]]; then
+            local chkpt_height
+            chkpt_height=$(tail -100 "${DFK_LOG}" 2>/dev/null \
+                | grep -oP '"height":\s*\K[0-9]+' 2>/dev/null | tail -1) || true
+            [[ -n "${chkpt_height}" ]] && [[ "${chkpt_height}" != "0" ]] && current="chkpt:${chkpt_height}"
+        fi
+
+        # 3. State sync: triesRemaining
         if [[ -z "${current}" ]]; then
             local tries
             tries=$(tail -100 "${DFK_LOG}" 2>/dev/null \
@@ -318,15 +331,15 @@ check_dfk_progress() {
             [[ -n "${tries}" ]] && current="sync:${tries}"
         fi
 
-        # 3. Block fetch count (when actively downloading blocks)
+        # 4. Block fetch count from checkpoint lines (fallback when no fetching-blocks entries)
         if [[ -z "${current}" ]]; then
-            local fetched
-            fetched=$(tail -100 "${DFK_LOG}" 2>/dev/null \
-                | grep -oP '"(?:numFetchedBlocks|blocksFetched)":\s*\K[0-9]+' 2>/dev/null | tail -1) || true
-            [[ -n "${fetched}" ]] && current="fetched:${fetched}"
+            local blocksfetched
+            blocksfetched=$(tail -100 "${DFK_LOG}" 2>/dev/null \
+                | grep -oP '"blocksFetched":\s*\K[0-9]+' 2>/dev/null | tail -1) || true
+            [[ -n "${blocksfetched}" ]] && current="fetched:${blocksfetched}"
         fi
 
-        # 4. Fallback: key=value height (skip 0, init artifact)
+        # 5. Fallback: key=value height (skip 0, init artifact)
         if [[ -z "${current}" ]]; then
             local height
             height=$(tail -100 "${DFK_LOG}" 2>/dev/null \
@@ -363,6 +376,24 @@ check_dfk_progress() {
         if [[ "${li}" -gt "${sl}" ]]; then
             state_set "dfk_progress_time" "${now}"
             return 0  # leaf progress = active large-trie sync, not stalled
+        fi
+    fi
+    # Secondary: Prometheus bs_fetched tracks block bootstrap download progress.
+    # During the long block-download phase, DFK log may not update for minutes even
+    # when the bootstrapper is actively fetching. bs_fetched growing = not stalled.
+    local bs_fetched stored_bs
+    bs_fetched=$(curl -sf --max-time 3 "http://localhost:9650/ext/metrics" 2>/dev/null \
+        | grep 'snowman_bs_fetched{chain="q2aTwKuyzgs8pynF7UXBZCU7DejbZbZ6EUyHr3JQzYgwNPUPi"}' \
+        | awk '{print $2}' | head -1) || true
+    stored_bs=$(state_get "dfk_bs_fetched" "0")
+    if [[ -n "${bs_fetched}" ]] && [[ "${bs_fetched}" != "0" ]]; then
+        local bf sb
+        bf=$(printf "%.0f" "${bs_fetched}" 2>/dev/null) || bf=0
+        sb=$(printf "%.0f" "${stored_bs}" 2>/dev/null) || sb=0
+        state_set "dfk_bs_fetched" "${bs_fetched}"
+        if [[ "${bf}" -gt "${sb}" ]]; then
+            state_set "dfk_progress_time" "${now}"
+            return 0  # block fetch progress = active bootstrap download, not stalled
         fi
     fi
     local elapsed=$(( now - stored_time ))
