@@ -53,7 +53,7 @@ readonly STALL_TIMEOUT_MINUTES=20      # Progress must change within this window
 readonly STALL_CHECKS_BEFORE_ACTION=3  # Consecutive stall checks required before restart
 readonly API_FAIL_THRESHOLD=3          # Consecutive API failures before restart
 readonly PEER_FAIL_THRESHOLD=5         # Consecutive 0-peer checks (5 min) before restart
-readonly PCHAIN_FAIL_THRESHOLD=10      # Consecutive P-chain unhealthy checks (10 min)
+readonly PCHAIN_FAIL_THRESHOLD=20      # Consecutive P-chain unhealthy checks (20 min)
 readonly DISK_WARN_PERCENT=85
 readonly DISK_CRITICAL_PERCENT=95
 readonly CHECK_INTERVAL_SECONDS=60
@@ -413,9 +413,32 @@ check_dfk_synced() {
 # 11. P-chain recent activity?
 check_pchain_health() {
     [[ ! -f "${P_CHAIN_LOG:-${LOG_DIR}/P.log}" ]] && return 0
+
+    # Prometheus bypass: snowman_bs_fetched{chain="P"} growing = actively fetching blocks.
+    # During bulk block download (24M+ blocks at 14K/s) the P-chain log is full of
+    # "fetching blocks" entries but the old grep missed them, causing false restarts.
+    # bs_fetched growing is the most reliable liveness signal during download phase.
+    local bs_fetched stored_bs
+    bs_fetched=$(curl -sf --max-time 3 "http://localhost:9650/ext/metrics" 2>/dev/null \
+        | grep 'avalanche_snowman_bs_fetched{chain="P"}' \
+        | awk '{print $2}' | head -1) || true
+    stored_bs=$(state_get "pchain_bs_fetched" "0")
+    if [[ -n "${bs_fetched}" ]] && [[ "${bs_fetched}" != "0" ]]; then
+        local bf sb
+        bf=$(printf "%.0f" "${bs_fetched}" 2>/dev/null) || bf=0
+        sb=$(printf "%.0f" "${stored_bs}" 2>/dev/null) || sb=0
+        state_set "pchain_bs_fetched" "${bs_fetched}"
+        if [[ "${bf}" -gt "${sb}" ]]; then
+            return 0  # P-chain actively fetching = healthy
+        fi
+    fi
+
+    # Log-based check: covers both block download and block execution phases.
+    # "fetching blocks" appears every 5s during bulk download.
+    # "executed blocks"/"executing blocks" appear during block execution phase.
     local found
-    found=$(tail -50 "${P_CHAIN_LOG:-${LOG_DIR}/P.log}" 2>/dev/null \
-        | grep -cE 'writeTXs|executing blocks|block accepted|consensus' \
+    found=$(tail -200 "${P_CHAIN_LOG:-${LOG_DIR}/P.log}" 2>/dev/null \
+        | grep -cE 'writeTXs|executing blocks|executed blocks|block accepted|consensus|fetching blocks' \
         2>/dev/null) || found=0
     [[ "${found:-0}" -gt 0 ]]
 }
