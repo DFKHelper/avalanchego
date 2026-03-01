@@ -714,7 +714,11 @@ recover_stalled() {
     # Either peers are present (but stalled) or outage exceeded 12h limit
     local reason
     if [[ "${dfk_peers}" -gt 0 ]]; then
-        reason="DFK peers present (${dfk_peers}/6) but no download progress"
+        if [[ "${outage_start}" != "0" ]]; then
+            reason="DFK peers returned (${dfk_peers}/6) after ${outage_min}m outage, download still stalled"
+        else
+            reason="DFK peers present (${dfk_peers}/6) but no download progress"
+        fi
     else
         reason="DFK peer outage exceeded ${max_outage_min}m limit (${dfk_peers}/6 peers)"
     fi
