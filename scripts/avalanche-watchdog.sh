@@ -683,6 +683,7 @@ recover_stalled() {
         local n; n=$(state_increment "stall_count")
         log_warn "Stall recovery #${n} (node API down)"
         state_reset "consecutive_stalls"
+        state_set "peer_outage_start_time" "0"
         restart_node "progress stalled — node API down (incident #${n})"
         return
     fi
@@ -720,6 +721,7 @@ recover_stalled() {
     local n; n=$(state_increment "stall_count")
     log_warn "Stall recovery #${n} (${reason})"
     state_reset "consecutive_stalls"
+    state_set "peer_outage_start_time" "0"
     restart_node "progress stalled — ${reason} (incident #${n})"
 }
 
@@ -915,6 +917,7 @@ main() {
                 state_reset "dfk_state_sync_retries"
                 state_reset "stall_count"
                 state_reset "consecutive_stalls"
+                state_set "peer_outage_start_time" "0"
             elif ! check_dfk_progress 2>/dev/null; then
                 local cs; cs=$(state_increment "consecutive_stalls")
                 log_warn "DFK stalled (${cs}/${STALL_CHECKS_BEFORE_ACTION})"
@@ -923,19 +926,20 @@ main() {
                 fi
             else
                 local prev_cs; prev_cs=$(state_get "consecutive_stalls" "0")
-                if [[ "${prev_cs}" -gt 0 ]]; then
-                    local outage_start; outage_start=$(state_get "peer_outage_start_time" "0")
-                    if [[ "${outage_start}" != "0" ]]; then
-                        local resume_now; resume_now=$(date '+%s')
-                        local outage_secs=$(( resume_now - outage_start ))
-                        local outage_min=$(( outage_secs / 60 ))
-                        local bf_raw; bf_raw=$(state_get "dfk_bs_fetched" "0")
-                        local bf_int; bf_int=$(printf "%.0f" "${bf_raw}" 2>/dev/null) || bf_int=0
-                        log_info "DFK peer outage ended — duration ${outage_min}m, download preserved at ~${bf_int} fetched blocks"
-                        state_set "peer_outage_start_time" "0"
-                    else
-                        log_info "DFK progress resumed (transient stall)"
-                    fi
+                local outage_start; outage_start=$(state_get "peer_outage_start_time" "0")
+                if [[ "${outage_start}" != "0" ]]; then
+                    # Clear outage timer whenever progress resumes and an outage was tracked —
+                    # regardless of consecutive_stalls value (recover_stalled resets it to 0,
+                    # so prev_cs can be 0 even after a full suppression cycle).
+                    local resume_now; resume_now=$(date '+%s')
+                    local outage_secs=$(( resume_now - outage_start ))
+                    local outage_min=$(( outage_secs / 60 ))
+                    local bf_raw; bf_raw=$(state_get "dfk_bs_fetched" "0")
+                    local bf_int; bf_int=$(printf "%.0f" "${bf_raw}" 2>/dev/null) || bf_int=0
+                    log_info "DFK peer outage ended — duration ${outage_min}m, download preserved at ~${bf_int} fetched blocks"
+                    state_set "peer_outage_start_time" "0"
+                elif [[ "${prev_cs}" -gt 0 ]]; then
+                    log_info "DFK progress resumed (transient stall)"
                 fi
                 state_reset "consecutive_stalls"
             fi
