@@ -109,10 +109,11 @@ restart_node() {
     state_set "last_restart_time" "$(date '+%s')"
     # Reset progress baseline so stall detection starts fresh after restart
     state_set "dfk_progress_value" "INIT"
-    # Reset leaf counter so post-restart leaf growth (from 0) correctly
-    # triggers the secondary stall check on the very first non-zero reading,
-    # rather than being compared against the pre-restart accumulated value.
+    # Reset secondary counters so post-restart growth (from 0) correctly
+    # triggers the secondary stall checks on the very first non-zero reading,
+    # rather than being compared against the pre-restart accumulated values.
     state_set "dfk_leafs_value" "0"
+    state_set "dfk_bs_fetched" "0"
     # Advance log offsets to skip pre-restart content — prevents false positives
     # from old error entries that remain in append-only log files
     _advance_log_offsets
@@ -548,6 +549,8 @@ recover_state_sync() {
         fi
 
         state_set "dfk_progress_value" "INIT"
+        state_set "dfk_leafs_value" "0"
+        state_set "dfk_bs_fetched" "0"
         state_reset "dfk_state_sync_retries"
         state_reset "stall_count"
         state_reset "consecutive_stalls"
@@ -596,6 +599,8 @@ recover_dfk_corruption() {
     # Reset all DFK sync state — node will resync from genesis
     state_reset "dfk_corruption_retries"
     state_set "dfk_progress_value" "INIT"
+    state_set "dfk_leafs_value" "0"
+    state_set "dfk_bs_fetched" "0"
     state_reset "dfk_state_sync_retries"
     state_reset "stall_count"
     state_reset "consecutive_stalls"
