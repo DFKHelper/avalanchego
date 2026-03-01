@@ -54,6 +54,7 @@ readonly STALL_CHECKS_BEFORE_ACTION=3  # Consecutive stall checks required befor
 readonly API_FAIL_THRESHOLD=3          # Consecutive API failures before restart
 readonly PEER_FAIL_THRESHOLD=5         # Consecutive 0-peer checks (5 min) before restart
 readonly PCHAIN_FAIL_THRESHOLD=20      # Consecutive P-chain unhealthy checks (20 min)
+readonly MIN_STALL_RESTART_INTERVAL_MINUTES=45  # Minimum minutes between stall-triggered restarts (prevent rapid double-restart during peer outages)
 readonly DISK_WARN_PERCENT=85
 readonly DISK_CRITICAL_PERCENT=95
 readonly CHECK_INTERVAL_SECONDS=60
@@ -103,6 +104,7 @@ is_node_running() { systemctl is-active --quiet "${NODE_SERVICE}" 2>/dev/null; }
 restart_node() {
     local reason="$1"
     log_warn "Restarting node: ${reason}"
+    state_set "last_restart_time" "$(date '+%s')"
     # Reset progress baseline so stall detection starts fresh after restart
     state_set "dfk_progress_value" "INIT"
     # Reset leaf counter so post-restart leaf growth (from 0) correctly
@@ -607,6 +609,18 @@ recover_main_db_corruption() {
 }
 
 recover_stalled() {
+    # Prevent rapid double-restart during transient peer outages.
+    # Restarting during DFK block-download loses all in-memory fetched blocks
+    # (numFetchedBlocks resets to 0). Enforce a minimum gap between stall restarts.
+    local now; now=$(date '+%s')
+    local last_restart; last_restart=$(state_get "last_restart_time" "0")
+    local since=$(( now - last_restart ))
+    local min_interval=$(( MIN_STALL_RESTART_INTERVAL_MINUTES * 60 ))
+    if [[ "${since}" -lt "${min_interval}" ]]; then
+        log_warn "Stall restart suppressed — last restart ${since}s ago (cooldown: ${min_interval}s); monitoring until cooldown expires"
+        state_reset "consecutive_stalls"
+        return 0
+    fi
     local n; n=$(state_increment "stall_count")
     log_warn "Stall recovery #${n}"
     state_reset "consecutive_stalls"
