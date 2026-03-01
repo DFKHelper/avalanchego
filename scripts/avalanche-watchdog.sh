@@ -236,31 +236,36 @@ check_peer_count() {
 #    Cross-references platform.getCurrentValidators with info.peers.
 #    Returns 0 on any API failure — conservative fallback (suppress restart).
 check_dfk_peer_count() {
-    local validators_resp peers_resp
-    validators_resp=$(curl -sf --max-time 10 -X POST "${NODE_API}/ext/bc/P" \
+    # Use temp files: the validators response can be 100KB+ (too large for env vars).
+    local tmpdir; tmpdir=$(mktemp -d 2>/dev/null) || { echo "0"; return; }
+    local tmpv="${tmpdir}/v.json" tmpp="${tmpdir}/p.json"
+
+    curl -sf --max-time 10 -X POST "${NODE_API}/ext/bc/P" \
         -H 'Content-Type: application/json' \
         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"platform.getCurrentValidators\",\"params\":{\"subnetID\":\"${DFK_SUBNET_ID}\"}}" \
-        2>/dev/null) || true
-    [[ -z "${validators_resp}" ]] && { echo "0"; return; }
+        -o "${tmpv}" 2>/dev/null || true
 
-    peers_resp=$(curl -sf --max-time 10 -X POST "${NODE_API}/ext/info" \
+    if [[ ! -s "${tmpv}" ]]; then rm -rf "${tmpdir}" 2>/dev/null; echo "0"; return; fi
+
+    curl -sf --max-time 10 -X POST "${NODE_API}/ext/info" \
         -H 'Content-Type: application/json' \
         -d '{"jsonrpc":"2.0","id":1,"method":"info.peers","params":{"nodeIDs":[]}}' \
-        2>/dev/null) || true
-    [[ -z "${peers_resp}" ]] && { echo "0"; return; }
+        -o "${tmpp}" 2>/dev/null || true
 
-    VALIDATORS_JSON="${validators_resp}" PEERS_JSON="${peers_resp}" \
-    python3 -c '
-import json, os
+    if [[ ! -s "${tmpp}" ]]; then rm -rf "${tmpdir}" 2>/dev/null; echo "0"; return; fi
+
+    python3 - "${tmpv}" "${tmpp}" <<'PYEOF' 2>/dev/null || echo "0"
+import json, sys
 try:
-    validators = json.loads(os.environ["VALIDATORS_JSON"])
-    peers_data = json.loads(os.environ["PEERS_JSON"])
+    with open(sys.argv[1]) as f: validators = json.load(f)
+    with open(sys.argv[2]) as f: peers_data = json.load(f)
     validator_ids = {v["nodeID"] for v in validators.get("result", {}).get("validators", [])}
     connected_ids = {p["nodeID"] for p in peers_data.get("result", {}).get("peers", [])}
     print(len(validator_ids & connected_ids))
 except:
     print(0)
-'
+PYEOF
+    rm -rf "${tmpdir}" 2>/dev/null || true
 }
 
 # 4. OOM kill of avalanchego process?
