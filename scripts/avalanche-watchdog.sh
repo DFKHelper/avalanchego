@@ -609,22 +609,60 @@ recover_main_db_corruption() {
 }
 
 recover_stalled() {
-    # Prevent rapid double-restart during transient peer outages.
-    # Restarting during DFK block-download loses all in-memory fetched blocks
-    # (numFetchedBlocks resets to 0). Enforce a minimum gap between stall restarts.
     local now; now=$(date '+%s')
+
+    # -----------------------------------------------------------------------
+    # Smart restart gate: distinguish DFK PEER OUTAGE from NODE CRASH.
+    #
+    # DFK has only 6 validators. When they go offline for maintenance, DFK
+    # block download stalls but the main avalanchego node is perfectly healthy.
+    # Restarting the node during a peer outage:
+    #   (a) loses all in-memory downloaded blocks (numFetchedBlocks → 0)
+    #   (b) doesn't fix the peer issue (node immediately stalls again)
+    #   (c) wastes 8+ hours of accumulated download progress
+    #
+    # Policy:
+    #   API healthy + stall < 4h  → peer outage; wait for peers to return
+    #   API healthy + stall ≥ 4h  → force restart (peers gone too long)
+    #   API unhealthy              → genuine crash; restart immediately
+    # -----------------------------------------------------------------------
+    local api_ok=0
+    if curl -sf --max-time 5 "http://localhost:9650/ext/health" >/dev/null 2>&1; then
+        api_ok=1
+    fi
+
+    local last_progress; last_progress=$(state_get "dfk_progress_time" "0")
+    local stall_secs=$(( now - last_progress ))
+    local max_stall_secs=$(( 4 * 3600 ))  # 4 hours
+
+    if [[ "${api_ok}" == "1" ]] && [[ "${stall_secs}" -lt "${max_stall_secs}" ]]; then
+        local stall_min=$(( stall_secs / 60 ))
+        local max_min=$(( max_stall_secs / 60 ))
+        log_warn "DFK stall: node healthy — DFK peer outage suspected (stalled ${stall_min}m, preserving download progress, force-restart after ${max_min}m)"
+        state_reset "consecutive_stalls"
+        return 0
+    fi
+
+    # Cooldown: prevent rapid double-restart (still useful when API goes down)
     local last_restart; last_restart=$(state_get "last_restart_time" "0")
     local since=$(( now - last_restart ))
     local min_interval=$(( MIN_STALL_RESTART_INTERVAL_MINUTES * 60 ))
     if [[ "${since}" -lt "${min_interval}" ]]; then
-        log_warn "Stall restart suppressed — last restart ${since}s ago (cooldown: ${min_interval}s); monitoring until cooldown expires"
+        log_warn "Stall restart suppressed — last restart ${since}s ago (cooldown: ${min_interval}s)"
         state_reset "consecutive_stalls"
         return 0
     fi
+
+    local reason
+    if [[ "${api_ok}" == "0" ]]; then
+        reason="node API down"
+    else
+        reason="stall exceeded 4h limit"
+    fi
     local n; n=$(state_increment "stall_count")
-    log_warn "Stall recovery #${n}"
+    log_warn "Stall recovery #${n} (${reason})"
     state_reset "consecutive_stalls"
-    restart_node "progress stalled ${STALL_TIMEOUT_MINUTES}+ minutes (incident #${n})"
+    restart_node "progress stalled — ${reason} (incident #${n})"
 }
 
 recover_crash_loop() {
