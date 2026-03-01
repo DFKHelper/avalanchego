@@ -627,7 +627,7 @@ recover_stalled() {
     #   API unhealthy              → genuine crash; restart immediately
     # -----------------------------------------------------------------------
     local api_ok=0
-    if curl -sf --max-time 5 "http://localhost:9650/ext/health" >/dev/null 2>&1; then
+    if curl -s --max-time 5 "http://localhost:9650/ext/health" >/dev/null 2>&1; then
         api_ok=1
     fi
 
