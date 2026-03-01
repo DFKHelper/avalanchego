@@ -54,7 +54,9 @@ readonly STALL_CHECKS_BEFORE_ACTION=3  # Consecutive stall checks required befor
 readonly API_FAIL_THRESHOLD=3          # Consecutive API failures before restart
 readonly PEER_FAIL_THRESHOLD=5         # Consecutive 0-peer checks (5 min) before restart
 readonly PCHAIN_FAIL_THRESHOLD=20      # Consecutive P-chain unhealthy checks (20 min)
-readonly MIN_STALL_RESTART_INTERVAL_MINUTES=45  # Minimum minutes between stall-triggered restarts (prevent rapid double-restart during peer outages)
+readonly MIN_STALL_RESTART_INTERVAL_MINUTES=45  # Minimum minutes between stall-triggered restarts (crash/API-down path)
+readonly DFK_SUBNET_ID="Vn3aX6hNRstj5VHHm63TCgPNaeGnRSqCYXQqemSqDd2TQH4qJ"
+readonly MAX_PEER_OUTAGE_HOURS=12   # Force restart only after 12h with no DFK peers
 readonly DISK_WARN_PERCENT=85
 readonly DISK_CRITICAL_PERCENT=95
 readonly CHECK_INTERVAL_SECONDS=60
@@ -230,7 +232,38 @@ check_peer_count() {
     [[ "${count:-1}" -gt 0 ]]
 }
 
-# 3. OOM kill of avalanchego process?
+# 3. Count connected DFK subnet validators (0–6).
+#    Cross-references platform.getCurrentValidators with info.peers.
+#    Returns 0 on any API failure — conservative fallback (suppress restart).
+check_dfk_peer_count() {
+    local validators_resp peers_resp
+    validators_resp=$(curl -sf --max-time 10 -X POST "${NODE_API}/ext/bc/P" \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"platform.getCurrentValidators\",\"params\":{\"subnetID\":\"${DFK_SUBNET_ID}\"}}" \
+        2>/dev/null) || true
+    [[ -z "${validators_resp}" ]] && { echo "0"; return; }
+
+    peers_resp=$(curl -sf --max-time 10 -X POST "${NODE_API}/ext/info" \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"info.peers","params":{"nodeIDs":[]}}' \
+        2>/dev/null) || true
+    [[ -z "${peers_resp}" ]] && { echo "0"; return; }
+
+    VALIDATORS_JSON="${validators_resp}" PEERS_JSON="${peers_resp}" \
+    python3 -c '
+import json, os
+try:
+    validators = json.loads(os.environ["VALIDATORS_JSON"])
+    peers_data = json.loads(os.environ["PEERS_JSON"])
+    validator_ids = {v["nodeID"] for v in validators.get("result", {}).get("validators", [])}
+    connected_ids = {p["nodeID"] for p in peers_data.get("result", {}).get("peers", [])}
+    print(len(validator_ids & connected_ids))
+except:
+    print(0)
+'
+}
+
+# 4. OOM kill of avalanchego process?
 check_oom_events() {
     local found
     # Window = check interval + 5s jitter so each OOM event triggers exactly one
@@ -612,7 +645,7 @@ recover_stalled() {
     local now; now=$(date '+%s')
 
     # -----------------------------------------------------------------------
-    # Smart restart gate: distinguish DFK PEER OUTAGE from NODE CRASH.
+    # Smart restart gate: use actual DFK peer count for accurate diagnosis.
     #
     # DFK has only 6 validators. When they go offline for maintenance, DFK
     # block download stalls but the main avalanchego node is perfectly healthy.
@@ -622,42 +655,62 @@ recover_stalled() {
     #   (c) wastes 8+ hours of accumulated download progress
     #
     # Policy:
-    #   API healthy + stall < 4h  → peer outage; wait for peers to return
-    #   API healthy + stall ≥ 4h  → force restart (peers gone too long)
-    #   API unhealthy              → genuine crash; restart immediately
+    #   API down                       → genuine crash; apply cooldown then restart
+    #   API up + 0 DFK peers + < 12h   → peer outage; wait for validators to return
+    #   API up + 0 DFK peers + ≥ 12h   → force restart (failsafe)
+    #   API up + DFK peers > 0         → restart (peers present but download stalled)
     # -----------------------------------------------------------------------
     local api_ok=0
     if curl -s --max-time 5 "http://localhost:9650/ext/health" >/dev/null 2>&1; then
         api_ok=1
     fi
 
-    local last_progress; last_progress=$(state_get "dfk_progress_time" "0")
-    local stall_secs=$(( now - last_progress ))
-    local max_stall_secs=$(( 4 * 3600 ))  # 4 hours
-
-    if [[ "${api_ok}" == "1" ]] && [[ "${stall_secs}" -lt "${max_stall_secs}" ]]; then
-        local stall_min=$(( stall_secs / 60 ))
-        local max_min=$(( max_stall_secs / 60 ))
-        log_warn "DFK stall: node healthy — DFK peer outage suspected (stalled ${stall_min}m, preserving download progress, force-restart after ${max_min}m)"
-        state_reset "consecutive_stalls"
-        return 0
-    fi
-
-    # Cooldown: prevent rapid double-restart (still useful when API goes down)
-    local last_restart; last_restart=$(state_get "last_restart_time" "0")
-    local since=$(( now - last_restart ))
-    local min_interval=$(( MIN_STALL_RESTART_INTERVAL_MINUTES * 60 ))
-    if [[ "${since}" -lt "${min_interval}" ]]; then
-        log_warn "Stall restart suppressed — last restart ${since}s ago (cooldown: ${min_interval}s)"
-        state_reset "consecutive_stalls"
-        return 0
-    fi
-
-    local reason
     if [[ "${api_ok}" == "0" ]]; then
-        reason="node API down"
+        # Node API unreachable — genuine crash; apply cooldown then restart
+        local last_restart; last_restart=$(state_get "last_restart_time" "0")
+        local since=$(( now - last_restart ))
+        local min_interval=$(( MIN_STALL_RESTART_INTERVAL_MINUTES * 60 ))
+        if [[ "${since}" -lt "${min_interval}" ]]; then
+            log_warn "Stall restart suppressed — API down but cooldown active (${since}s / ${min_interval}s)"
+            state_reset "consecutive_stalls"
+            return 0
+        fi
+        local n; n=$(state_increment "stall_count")
+        log_warn "Stall recovery #${n} (node API down)"
+        state_reset "consecutive_stalls"
+        restart_node "progress stalled — node API down (incident #${n})"
+        return
+    fi
+
+    # API is up — query actual DFK peer count for accurate diagnosis
+    local dfk_peers; dfk_peers=$(check_dfk_peer_count)
+
+    # Track when this peer outage started (persistent across node restarts —
+    # NOT reset in restart_node because a restart doesn't bring validators back)
+    local outage_start; outage_start=$(state_get "peer_outage_start_time" "0")
+    if [[ "${dfk_peers}" -eq 0 ]] && [[ "${outage_start}" == "0" ]]; then
+        state_set "peer_outage_start_time" "${now}"
+        outage_start="${now}"
+    fi
+
+    local outage_secs=$(( now - outage_start ))
+    local outage_min=$(( outage_secs / 60 ))
+    local max_outage_secs=$(( MAX_PEER_OUTAGE_HOURS * 3600 ))
+    local max_outage_min=$(( max_outage_secs / 60 ))
+
+    if [[ "${dfk_peers}" -eq 0 ]] && [[ "${outage_secs}" -lt "${max_outage_secs}" ]]; then
+        # No DFK validators connected — restart won't help, wait for them to return
+        log_warn "DFK stall: 0/6 DFK peers connected — waiting for validators (outage ${outage_min}m / max ${max_outage_min}m)"
+        state_reset "consecutive_stalls"
+        return 0
+    fi
+
+    # Either peers are present (but stalled) or outage exceeded 12h limit
+    local reason
+    if [[ "${dfk_peers}" -gt 0 ]]; then
+        reason="DFK peers present (${dfk_peers}/6) but no download progress"
     else
-        reason="stall exceeded 4h limit"
+        reason="DFK peer outage exceeded ${max_outage_min}m limit (${dfk_peers}/6 peers)"
     fi
     local n; n=$(state_increment "stall_count")
     log_warn "Stall recovery #${n} (${reason})"
@@ -865,7 +918,20 @@ main() {
                 fi
             else
                 local prev_cs; prev_cs=$(state_get "consecutive_stalls" "0")
-                [[ "${prev_cs}" -gt 0 ]] && log_info "DFK progress resumed"
+                if [[ "${prev_cs}" -gt 0 ]]; then
+                    local outage_start; outage_start=$(state_get "peer_outage_start_time" "0")
+                    if [[ "${outage_start}" != "0" ]]; then
+                        local resume_now; resume_now=$(date '+%s')
+                        local outage_secs=$(( resume_now - outage_start ))
+                        local outage_min=$(( outage_secs / 60 ))
+                        local bf_raw; bf_raw=$(state_get "dfk_bs_fetched" "0")
+                        local bf_int; bf_int=$(printf "%.0f" "${bf_raw}" 2>/dev/null) || bf_int=0
+                        log_info "DFK peer outage ended — duration ${outage_min}m, download preserved at ~${bf_int} fetched blocks"
+                        state_set "peer_outage_start_time" "0"
+                    else
+                        log_info "DFK progress resumed (transient stall)"
+                    fi
+                fi
                 state_reset "consecutive_stalls"
             fi
         fi
@@ -902,7 +968,13 @@ main() {
             local mode; mode=$(state_get "dfk_mode" "unknown")
             local dfk_corrupt; dfk_corrupt=$(state_get "dfk_corruption_retries" "0")
             local main_corrupt; main_corrupt=$(state_get "main_corruption_retries" "0")
-            log_info "Status: disk=${disk_pct} dfk=${mode} progress=${progress} sync_retries=${retries} dfk_corrupt=${dfk_corrupt} main_corrupt=${main_corrupt}"
+            local outage_start; outage_start=$(state_get "peer_outage_start_time" "0")
+            local outage_info=""
+            if [[ "${outage_start}" != "0" ]]; then
+                local outage_secs=$(( now - outage_start ))
+                outage_info=" peer_outage=$(( outage_secs / 60 ))m"
+            fi
+            log_info "Status: disk=${disk_pct} dfk=${mode} progress=${progress} sync_retries=${retries} dfk_corrupt=${dfk_corrupt} main_corrupt=${main_corrupt}${outage_info}"
         fi
     done
 }
