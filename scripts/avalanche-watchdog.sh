@@ -114,6 +114,7 @@ restart_node() {
     # rather than being compared against the pre-restart accumulated values.
     state_set "dfk_leafs_value" "0"
     state_set "dfk_bs_fetched" "0"
+    state_set "pchain_bs_fetched" "0"
     # Advance log offsets to skip pre-restart content — prevents false positives
     # from old error entries that remain in append-only log files
     _advance_log_offsets
@@ -648,6 +649,7 @@ recover_main_db_corruption() {
     state_set "dfk_progress_value" "INIT"
     state_reset "stall_count"
     state_reset "consecutive_stalls"
+    state_set "pchain_bs_fetched" "0"
 
     start_node
     log_info "Node starting — P-chain resync beginning (fast via partial-sync)"
