@@ -552,6 +552,7 @@ recover_state_sync() {
         state_reset "stall_count"
         state_reset "consecutive_stalls"
         state_set "dfk_mode" "block_sync"
+        state_set "peer_outage_start_time" "0"
         start_node
         log_info "DFK chain will now sync block-by-block"
     fi
@@ -599,6 +600,7 @@ recover_dfk_corruption() {
     state_reset "stall_count"
     state_reset "consecutive_stalls"
     state_set "dfk_mode" "unknown"
+    state_set "peer_outage_start_time" "0"
 
     start_node
     log_info "DFK chain wiped — will resync from network (state sync if configured, else block sync)"
