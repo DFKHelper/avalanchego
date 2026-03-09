@@ -1084,16 +1084,17 @@ func (db *Database) periodicFlush() {
 		case <-db.flushTicker.C:
 			db.pendingMu.Lock()
 			if len(db.pending.ops) > 0 {
+				opsCount := len(db.pending.ops)
 				if err := db.flushLocked(); err != nil {
 					if db.log != nil {
 						db.log.Error("Periodic flush failed",
-							zap.Int("pendingOps", len(db.pending.ops)),
+							zap.Int("pendingOps", opsCount),
 							zap.Error(err),
 						)
 					}
 				} else if db.log != nil {
 					db.log.Debug("Periodic flush committed pending writes",
-						zap.Int("opsCount", len(db.pending.ops)),
+						zap.Int("opsCount", opsCount),
 					)
 				}
 			}

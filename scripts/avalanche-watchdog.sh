@@ -358,13 +358,16 @@ check_dfk_progress() {
 
     local current=""
     if [[ -f "${DFK_LOG}" ]]; then
+        local log_tail
+        log_tail=$(tail -100 "${DFK_LOG}" 2>/dev/null) || true
+
         # 1. Block fetch count from "fetching blocks" log entries — HIGHEST PRIORITY.
         #    These appear every ~18s during the long block-download phase and are the
         #    only reliable liveness signal. Must come before checkpoint height because
         #    checkpoint height only changes in rapid bursts at startup, then stays static
         #    for hours while the node is actively downloading — causing false stall fires.
         local fetched
-        fetched=$(tail -100 "${DFK_LOG}" 2>/dev/null \
+        fetched=$(echo "${log_tail}" \
             | grep '"numFetchedBlocks"' 2>/dev/null \
             | grep -oP '"numFetchedBlocks":\s*\K[0-9]+' 2>/dev/null | tail -1) || true
         [[ -n "${fetched}" ]] && current="fetched:${fetched}"
@@ -372,7 +375,7 @@ check_dfk_progress() {
         # 2. Checkpoint height — indicator during block execution bursts
         if [[ -z "${current}" ]]; then
             local chkpt_height
-            chkpt_height=$(tail -100 "${DFK_LOG}" 2>/dev/null \
+            chkpt_height=$(echo "${log_tail}" \
                 | grep -oP '"height":\s*\K[0-9]+' 2>/dev/null | tail -1) || true
             [[ -n "${chkpt_height}" ]] && [[ "${chkpt_height}" != "0" ]] && current="chkpt:${chkpt_height}"
         fi
@@ -380,7 +383,7 @@ check_dfk_progress() {
         # 3. State sync: triesRemaining
         if [[ -z "${current}" ]]; then
             local tries
-            tries=$(tail -100 "${DFK_LOG}" 2>/dev/null \
+            tries=$(echo "${log_tail}" \
                 | grep -oP 'triesRemaining=\K[0-9]+' 2>/dev/null | tail -1) || true
             [[ -n "${tries}" ]] && current="sync:${tries}"
         fi
@@ -388,7 +391,7 @@ check_dfk_progress() {
         # 4. Block fetch count from checkpoint lines (fallback when no fetching-blocks entries)
         if [[ -z "${current}" ]]; then
             local blocksfetched
-            blocksfetched=$(tail -100 "${DFK_LOG}" 2>/dev/null \
+            blocksfetched=$(echo "${log_tail}" \
                 | grep -oP '"blocksFetched":\s*\K[0-9]+' 2>/dev/null | tail -1) || true
             [[ -n "${blocksfetched}" ]] && current="fetched:${blocksfetched}"
         fi
@@ -396,7 +399,7 @@ check_dfk_progress() {
         # 5. Fallback: key=value height (skip 0, init artifact)
         if [[ -z "${current}" ]]; then
             local height
-            height=$(tail -100 "${DFK_LOG}" 2>/dev/null \
+            height=$(echo "${log_tail}" \
                 | grep -oP '(?:height|blkHeight|blockHeight)=\K[0-9]+' 2>/dev/null | tail -1) || true
             [[ -n "${height}" ]] && [[ "${height}" != "0" ]] && current="block:${height}"
         fi
@@ -437,7 +440,7 @@ check_dfk_progress() {
     # when the bootstrapper is actively fetching. bs_fetched growing = not stalled.
     local bs_fetched stored_bs
     bs_fetched=$(curl -sf --max-time 3 "http://localhost:9650/ext/metrics" 2>/dev/null \
-        | grep 'snowman_bs_fetched{chain="q2aTwKuyzgs8pynF7UXBZCU7DejbZbZ6EUyHr3JQzYgwNPUPi"}' \
+        | grep "snowman_bs_fetched{chain=\"${DFK_CHAIN_ID}\"}" \
         | awk '{print $2}' | head -1) || true
     stored_bs=$(state_get "dfk_bs_fetched" "0")
     if [[ -n "${bs_fetched}" ]] && [[ "${bs_fetched}" != "0" ]]; then
