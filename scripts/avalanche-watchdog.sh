@@ -396,6 +396,14 @@ check_dfk_progress() {
             [[ -n "${blocksfetched}" ]] && current="fetched:${blocksfetched}"
         fi
 
+        # 4b. Block execution phase: numExecuted from "executing blocks" log entries
+        if [[ -z "${current}" ]]; then
+            local numexecuted
+            numexecuted=$(echo "${log_tail}" \
+                | grep -oP '"numExecuted":\s*\K[0-9]+' 2>/dev/null | tail -1) || true
+            [[ -n "${numexecuted}" ]] && current="executed:${numexecuted}"
+        fi
+
         # 5. Fallback: key=value height (skip 0, init artifact)
         if [[ -z "${current}" ]]; then
             local height
