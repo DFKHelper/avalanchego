@@ -467,10 +467,18 @@ check_dfk_progress() {
 
 # 10. DFK chain reached normal consensus (sync complete)?
 check_dfk_synced() {
+    # Primary: Prometheus bootstrap_finished metric (most reliable, survives log rotation)
+    local metric_val
+    metric_val=$(curl -sf --max-time 3 "http://localhost:9650/ext/metrics" 2>/dev/null \
+        | grep "avalanche_snowman_bootstrap_finished{chain=\"${DFK_CHAIN_ID}\"}" \
+        | awk '{print $2}' | cut -d'.' -f1) || true
+    [[ "${metric_val:-0}" == "1" ]] && return 0
+
+    # Fallback: log patterns (covers offline metric endpoint)
     [[ ! -f "${DFK_LOG}" ]] && return 1
     local found
     found=$(tail -100 "${DFK_LOG}" 2>/dev/null \
-        | grep -cE 'normal operations started|bootstrapping finished|transitioning to normal operations' \
+        | grep -cE 'normal operations started|bootstrapping finished|transitioning to normal operations|starting consensus' \
         2>/dev/null) || found=0
     [[ "${found:-0}" -gt 0 ]]
 }
