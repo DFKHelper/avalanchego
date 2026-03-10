@@ -275,8 +275,11 @@ func (db *Database) flushLocked() error {
 	// This catches Firewood FFI bugs where Propose+Commit succeeds but data is lost
 	verifyCount := 0
 	for _, op := range db.pending.ops {
-		if op.delete || verifyCount >= 3 {
+		if verifyCount >= 3 {
 			break
+		}
+		if op.delete {
+			continue
 		}
 		readBack, err := db.fw.GetFromRoot(db.currentRoot, op.key)
 		if err != nil || readBack == nil {
@@ -319,8 +322,11 @@ func (db *Database) flushLocked() error {
 	// Clear pending batch
 	db.pending = newPendingBatch()
 
+	db.registryMu.RLock()
+	registrySize := len(db.registry)
+	db.registryMu.RUnlock()
 	db.log.Debug("Flushed pending batch",
-		zap.Int("registrySize", len(db.registry)),
+		zap.Int("registrySize", registrySize),
 	)
 
 	return nil
@@ -505,7 +511,6 @@ func (db *Database) saveRegistryLegacyGob() {
 		db.log.Debug("Failed to create legacy gob file (non-fatal)", zap.Error(err))
 		return
 	}
-	defer f.Close()
 
 	encoder := gob.NewEncoder(f)
 	if err := encoder.Encode(db.registry); err != nil {
@@ -1083,6 +1088,13 @@ func (db *Database) periodicFlush() {
 		select {
 		case <-db.flushTicker.C:
 			db.pendingMu.Lock()
+			// Guard against a race where the timer fires just before Close()
+			// stops the ticker, causing flushLocked() to call fw.Propose() on
+			// an already-closed FFI database.
+			if db.closed.Load() {
+				db.pendingMu.Unlock()
+				return
+			}
 			if len(db.pending.ops) > 0 {
 				opsCount := len(db.pending.ops)
 				if err := db.flushLocked(); err != nil {
@@ -1260,8 +1272,11 @@ func (b *batch) Write() error {
 	// Write-back verification: spot-check that batch data is readable after commit
 	verifyCount := 0
 	for _, op := range b.ops {
-		if op.delete || verifyCount >= 3 {
+		if verifyCount >= 3 {
 			break
+		}
+		if op.delete {
+			continue
 		}
 		readBack, err := b.db.fw.GetFromRoot(b.db.currentRoot, op.key)
 		if err != nil || readBack == nil {

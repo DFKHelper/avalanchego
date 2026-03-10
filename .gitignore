@@ -77,3 +77,6 @@ docs/
 
 # Development scripts
 scripts/dev/
+
+# Temporary test server files
+*.go.tmp

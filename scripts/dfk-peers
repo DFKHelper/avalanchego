@@ -1,0 +1,54 @@
+#!/bin/bash
+DFK_SUBNET="Vn3aX6hNRstj5VHHm63TCgPNaeGnRSqCYXQqemSqDd2TQH4qJ"
+NODE_API="http://localhost:9650"
+echo "📡 DFK SUBNET PEERS"
+echo "═══════════════════════════════════════════════════════════"
+echo ""
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+curl -sf --max-time 10 -X POST "${NODE_API}/ext/bc/P" \
+    -H "Content-Type: application/json" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"platform.getCurrentValidators","params":{"subnetID":"'"${DFK_SUBNET}"'"}}' \
+    2>/dev/null > "$TMP/validators.json"
+
+curl -sf --max-time 10 -X POST "${NODE_API}/ext/info" \
+    -H "Content-Type: application/json" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"info.peers","params":{"nodeIDs":[]}}' \
+    2>/dev/null > "$TMP/peers.json"
+
+if [ ! -s "$TMP/validators.json" ] || [ ! -s "$TMP/peers.json" ]; then
+    echo "   ⚠️  Could not reach node API"; exit 1
+fi
+
+python3 - "$TMP/validators.json" "$TMP/peers.json" << 'PY'
+import json, sys
+from datetime import datetime, timezone
+with open(sys.argv[1]) as f: v_data = json.load(f)
+with open(sys.argv[2]) as f: p_data = json.load(f)
+validators = v_data.get("result", {}).get("validators", [])
+peers = {p["nodeID"]: p for p in p_data.get("result", {}).get("peers", [])}
+connected = 0
+total = len(validators)
+for v in sorted(validators, key=lambda x: x.get("nodeID", "")):
+    nid = v.get("nodeID", "?")
+    end_ts = int(v.get("endTime", 0))
+    end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%Y-%m-%d") if end_ts else "?"
+    stake = int(v.get("weight", v.get("stakeAmount", 0)))
+    stake_avax = stake / 1e9
+    if nid in peers:
+        p = peers[nid]
+        ip = p.get("ip", "?")
+        version = p.get("version", "?")
+        print(f"   \u2705  {nid}")
+        print(f"       IP: {ip}  version: {version}  stake: {stake_avax:.0f} AVAX  expires: {end_dt}")
+        connected += 1
+    else:
+        print(f"   \u274c  {nid}")
+        print(f"       (not connected)  stake: {stake_avax:.0f} AVAX  expires: {end_dt}")
+    print()
+print(f"   Connected: {connected}/{total} DFK validators")
+PY
+echo ""
+echo "═══════════════════════════════════════════════════════════"
+echo "Updated: $(date '+%Y-%m-%d %H:%M:%S')"

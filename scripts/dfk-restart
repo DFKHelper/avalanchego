@@ -1,0 +1,27 @@
+#!/bin/bash
+echo "🔄 DFK NODE SAFE RESTART"
+echo "═══════════════════════════════════════════════════════════"
+echo ""
+echo "   This will restart avalanchego via systemd."
+echo "   The watchdog will resume monitoring automatically."
+echo ""
+read -rp "   Confirm restart? [y/N] " CONFIRM
+echo ""
+if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+    echo "   Cancelled."; exit 0
+fi
+echo "   Stopping node..."
+systemctl stop avalanchego
+echo "   Waiting for process to exit..."
+for i in $(seq 1 15); do pgrep -f avalanchego > /dev/null || break; sleep 1; done
+echo "   Starting node..."
+systemctl start avalanchego
+echo "   Waiting for API to come up..."
+for i in $(seq 1 60); do
+    if curl -sf --max-time 2 http://localhost:9650/ext/metrics > /dev/null 2>&1; then
+        echo "   ✅ Node is up (${i}s)"; echo ""; dfk-block; exit 0
+    fi
+    sleep 1
+done
+echo "   ⚠️  API did not respond within 60s — check: dfk-logs"
+exit 1

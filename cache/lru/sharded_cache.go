@@ -4,8 +4,7 @@
 package lru
 
 import (
-	"fmt"
-	"hash/fnv"
+	"hash/maphash"
 
 	"github.com/ava-labs/avalanchego/cache"
 )
@@ -25,6 +24,7 @@ var _ cache.Cacher[struct{}, struct{}] = (*ShardedCache[struct{}, struct{}])(nil
 type ShardedCache[K comparable, V any] struct {
 	shards    []*Cache[K, V]
 	numShards int
+	seed      maphash.Seed
 }
 
 // NewShardedCache creates a new sharded LRU cache with the given total size.
@@ -59,23 +59,15 @@ func NewShardedCacheWithOptions[K comparable, V any](size, numShards int, onEvic
 	return &ShardedCache[K, V]{
 		shards:    shards,
 		numShards: numShards,
+		seed:      maphash.MakeSeed(),
 	}
 }
 
-// getShard returns the shard index for a given key using FNV-1a hash.
-// FNV-1a provides good distribution and is fast for short keys.
+// getShard returns the shard for a given key using maphash.Comparable,
+// which handles all comparable types without reflection or string conversion.
 func (sc *ShardedCache[K, V]) getShard(key K) *Cache[K, V] {
-	// Hash the key to determine shard
-	h := fnv.New64a()
-
-	// Convert key to string, then to bytes for hashing
-	// This works for all comparable types (string, int, struct, etc.)
-	keyStr := fmt.Sprint(key)
-	h.Write([]byte(keyStr))
-
-	// Use modulo to get shard index
-	shardIdx := h.Sum64() % uint64(sc.numShards)
-	return sc.shards[shardIdx]
+	h := maphash.Comparable(sc.seed, key)
+	return sc.shards[h%uint64(sc.numShards)]
 }
 
 // Put adds or updates a key-value pair in the cache.

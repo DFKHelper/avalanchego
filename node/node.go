@@ -878,6 +878,11 @@ func (n *Node) runDatabaseHealthChecks(db database.Database) {
 	for {
 		select {
 		case <-ticker.C:
+			// Skip if node is already shutting down
+			if n.shuttingDown.Get() {
+				return
+			}
+
 			var lastErr error
 			healthCheckPassed := false
 
@@ -903,6 +908,9 @@ func (n *Node) runDatabaseHealthChecks(db database.Database) {
 					// Wait before retry for temporary closure to complete
 					if attempt < maxRetries {
 						time.Sleep(retryDelay)
+						if n.shuttingDown.Get() {
+							return
+						}
 						continue
 					}
 					// If still closed after all retries, this might be a real issue
@@ -918,6 +926,9 @@ func (n *Node) runDatabaseHealthChecks(db database.Database) {
 
 				if attempt < maxRetries {
 					time.Sleep(retryDelay)
+					if n.shuttingDown.Get() {
+						return
+					}
 				}
 			}
 
@@ -945,10 +956,10 @@ func (n *Node) runDatabaseHealthChecks(db database.Database) {
 				zap.Int("retriesAttempted", maxRetries),
 			)
 
-			// Trigger graceful shutdown for persistent corruption
-			// This prevents further damage to the database
+			// Trigger graceful shutdown for persistent corruption to prevent further damage
 			n.Log.Fatal("shutting down node due to persistent database health check failure")
-			os.Exit(1)
+			go n.Shutdown(1)
+			return
 		}
 	}
 }
@@ -958,8 +969,9 @@ func (n *Node) runDatabaseHealthChecks(db database.Database) {
 // to be independently managed and deleted without affecting other chains.
 //
 // Directory structure:
-//   {dbPath}/{networkID}/{dbVersion}/{chainID}/
+//   {dbPath}/{dbFolderName}/{chainID}
 //
+// where dbFolderName is derived from the database engine type.
 // Note: P-chain uses ids.Empty as its chain ID, which is valid.
 //
 // Returns a metered database instance for the chain.

@@ -4,7 +4,9 @@
 package migrate
 
 import (
+	"bytes"
 	"fmt"
+	"slices"
 
 	"go.uber.org/zap"
 
@@ -16,6 +18,11 @@ import (
 const (
 	// chainIDPrefixLen is the length of the chain ID prefix (32 bytes)
 	chainIDPrefixLen = 32
+
+	// migrateBatchFlushSize is the byte threshold at which a write batch is
+	// flushed to the target database during migration (~16 MB, matching
+	// LevelDB's default write-buffer size).
+	migrateBatchFlushSize = 16 * 1024 * 1024
 )
 
 // PerChainMigrator handles migration from monolithic database to per-chain databases.
@@ -75,21 +82,45 @@ func (m *PerChainMigrator) Migrate() error {
 		return fmt.Errorf("no target databases registered")
 	}
 
+	// Reset statistics for this migration run
+	m.keysProcessed = 0
+	m.keysCopied = 0
+	m.keysSkipped = 0
+
 	m.log.Info("starting per-chain database migration",
 		zap.Int("targetChains", len(m.chainDBs)),
 	)
+
+	// One write batch per target chain DB for efficient bulk writes.
+	batches := make(map[ids.ID]database.Batch, len(m.chainDBs))
+	for chainID, db := range m.chainDBs {
+		batches[chainID] = db.NewBatch()
+	}
+	flushBatch := func(chainID ids.ID) error {
+		b := batches[chainID]
+		if err := b.Write(); err != nil {
+			return fmt.Errorf("failed to flush batch for chain %s: %w", chainID, err)
+		}
+		b.Reset()
+		return nil
+	}
+	// On error paths, flush any remaining (unflushed) batch data best-effort.
+	// The success path uses the explicit final flush loop below and sets this flag.
+	var allFlushed bool
+	defer func() {
+		if allFlushed {
+			return
+		}
+		for chainID := range batches {
+			_ = flushBatch(chainID)
+		}
+	}()
 
 	// Create iterator for entire source database
 	iterator := m.sourceDB.NewIterator()
 	defer iterator.Release()
 
-	// Process each key
 	for iterator.Next() {
-		// IMPORTANT: iterator.Key() and iterator.Value() return slices that may be reused
-		// on the next iteration. We must copy them before using.
-		key := copyBytes(iterator.Key())
-		value := copyBytes(iterator.Value())
-
 		m.keysProcessed++
 
 		// Log progress every 10000 keys
@@ -101,32 +132,31 @@ func (m *PerChainMigrator) Migrate() error {
 			)
 		}
 
-		// Check if key has chain ID prefix
-		if len(key) < chainIDPrefixLen {
+		// Check key length before copying — short keys are skipped immediately.
+		// iterator.Key() and iterator.Value() are only valid until the next Next() call.
+		rawKey := iterator.Key()
+		if len(rawKey) < chainIDPrefixLen {
 			m.keysSkipped++
 			m.log.Debug("skipping key without chain ID prefix",
-				zap.Int("keyLength", len(key)),
+				zap.Int("keyLength", len(rawKey)),
 			)
 			continue
 		}
 
 		// Extract chain ID from first 32 bytes
-		chainIDBytes := key[:chainIDPrefixLen]
-		chainID, err := ids.ToID(chainIDBytes)
+		chainID, err := ids.ToID(rawKey[:chainIDPrefixLen])
 		if err != nil {
 			m.keysSkipped++
 			m.log.Debug("skipping key with invalid chain ID prefix",
-				zap.Binary("prefix", chainIDBytes),
+				zap.Binary("prefix", rawKey[:chainIDPrefixLen]),
 				zap.Error(err),
 			)
 			continue
 		}
 
 		// Check if we have a target database for this chain
-		targetDB, exists := m.chainDBs[chainID]
-		if !exists {
+		if _, exists := m.chainDBs[chainID]; !exists {
 			m.keysSkipped++
-			// Don't log every skipped key - too verbose
 			if m.keysSkipped%10000 == 0 {
 				m.log.Debug("skipping key for unregistered chain",
 					zap.Stringer("chainID", chainID),
@@ -135,21 +165,35 @@ func (m *PerChainMigrator) Migrate() error {
 			continue
 		}
 
-		// Strip chain ID prefix from key
-		keyWithoutPrefix := key[chainIDPrefixLen:]
+		// Now that we know this key will be written, copy key and value.
+		keyWithoutPrefix := slices.Clone(rawKey[chainIDPrefixLen:])
+		value := slices.Clone(iterator.Value())
 
-		// Copy to target database
-		if err := targetDB.Put(keyWithoutPrefix, value); err != nil {
-			return fmt.Errorf("failed to write key to chain %s database: %w", chainID, err)
+		batch := batches[chainID]
+		if err := batch.Put(keyWithoutPrefix, value); err != nil {
+			return fmt.Errorf("failed to stage key for chain %s: %w", chainID, err)
 		}
-
 		m.keysCopied++
+
+		// Flush batch when it reaches the size threshold
+		if batch.Size() >= migrateBatchFlushSize {
+			if err := flushBatch(chainID); err != nil {
+				return err
+			}
+		}
 	}
 
-	// Check for iterator errors
 	if err := iterator.Error(); err != nil {
 		return fmt.Errorf("iterator error during migration: %w", err)
 	}
+
+	// Flush all remaining batches
+	for chainID := range batches {
+		if err := flushBatch(chainID); err != nil {
+			return err
+		}
+	}
+	allFlushed = true
 
 	m.log.Info("per-chain database migration completed",
 		zap.Int("keysProcessed", m.keysProcessed),
@@ -168,38 +212,32 @@ func (m *PerChainMigrator) VerifyMigration() error {
 	m.log.Info("verifying per-chain database migration")
 
 	verified := 0
-	errors := 0
+	errCount := 0
 
-	// Create iterator for entire source database
 	iterator := m.sourceDB.NewIterator()
 	defer iterator.Release()
 
-	// Verify each key
 	for iterator.Next() {
-		// IMPORTANT: iterator.Key() and iterator.Value() return slices that may be reused
-		key := copyBytes(iterator.Key())
-		value := copyBytes(iterator.Value())
+		rawKey := iterator.Key()
 
 		// Skip keys without chain ID prefix
-		if len(key) < chainIDPrefixLen {
+		if len(rawKey) < chainIDPrefixLen {
 			continue
 		}
 
-		// Extract chain ID
-		chainIDBytes := key[:chainIDPrefixLen]
-		chainID, err := ids.ToID(chainIDBytes)
+		chainID, err := ids.ToID(rawKey[:chainIDPrefixLen])
 		if err != nil {
 			continue
 		}
 
-		// Check if we migrated this chain
 		targetDB, exists := m.chainDBs[chainID]
 		if !exists {
-			continue // Not migrated, skip
+			continue
 		}
 
-		// Verify key exists in target database
-		keyWithoutPrefix := key[chainIDPrefixLen:]
+		// Copy key since we need it past the next iterator.Next() call.
+		// Value is only needed for comparison; copy only if Get succeeds.
+		keyWithoutPrefix := slices.Clone(rawKey[chainIDPrefixLen:])
 		targetValue, err := targetDB.Get(keyWithoutPrefix)
 		if err != nil {
 			m.log.Error("verification failed: key missing in target database",
@@ -207,27 +245,26 @@ func (m *PerChainMigrator) VerifyMigration() error {
 				zap.Binary("key", keyWithoutPrefix[:min(32, len(keyWithoutPrefix))]),
 				zap.Error(err),
 			)
-			errors++
+			errCount++
 			continue
 		}
 
-		// Verify value matches
-		if !bytesEqual(value, targetValue) {
+		// Compare directly against the iterator's value buffer — no copy needed here.
+		if !bytes.Equal(iterator.Value(), targetValue) {
 			m.log.Error("verification failed: value mismatch",
 				zap.Stringer("chainID", chainID),
 				zap.Binary("key", keyWithoutPrefix[:min(32, len(keyWithoutPrefix))]),
 			)
-			errors++
+			errCount++
 			continue
 		}
 
 		verified++
 
-		// Log progress
 		if verified%10000 == 0 {
 			m.log.Info("verification progress",
 				zap.Int("verified", verified),
-				zap.Int("errors", errors),
+				zap.Int("errors", errCount),
 			)
 		}
 	}
@@ -238,11 +275,11 @@ func (m *PerChainMigrator) VerifyMigration() error {
 
 	m.log.Info("migration verification completed",
 		zap.Int("verified", verified),
-		zap.Int("errors", errors),
+		zap.Int("errors", errCount),
 	)
 
-	if errors > 0 {
-		return fmt.Errorf("verification failed with %d errors", errors)
+	if errCount > 0 {
+		return fmt.Errorf("verification failed with %d errors", errCount)
 	}
 
 	return nil
@@ -251,36 +288,4 @@ func (m *PerChainMigrator) VerifyMigration() error {
 // GetStatistics returns migration statistics.
 func (m *PerChainMigrator) GetStatistics() (keysProcessed, keysCopied, keysSkipped int) {
 	return m.keysProcessed, m.keysCopied, m.keysSkipped
-}
-
-// Helper functions
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// copyBytes creates a copy of a byte slice.
-// This is necessary because database iterators may reuse the underlying buffer.
-func copyBytes(src []byte) []byte {
-	if src == nil {
-		return nil
-	}
-	dst := make([]byte, len(src))
-	copy(dst, src)
-	return dst
 }

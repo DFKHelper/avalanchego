@@ -213,14 +213,9 @@ func TestPerChainMigrator_RegisterChainDB_Errors(t *testing.T) {
 	sourceDB := memdb.New()
 	migrator := NewPerChainMigrator(sourceDB, logging.NoLog{})
 
-	// Error on empty chain ID
-	err := migrator.RegisterChainDB(ids.Empty, memdb.New())
-	require.Error(err)
-	require.Contains(err.Error(), "empty chain ID")
-
 	// Error on nil database
 	chainID := ids.GenerateTestID()
-	err = migrator.RegisterChainDB(chainID, nil)
+	err := migrator.RegisterChainDB(chainID, nil)
 	require.Error(err)
 	require.Contains(err.Error(), "cannot be nil")
 
@@ -364,51 +359,3 @@ func TestPerChainMigrator_MultipleChains(t *testing.T) {
 	require.NoError(migrator.VerifyMigration())
 }
 
-func TestCopyBytes(t *testing.T) {
-	require := require.New(t)
-
-	// Test nil slice
-	require.Nil(copyBytes(nil))
-
-	// Test empty slice
-	empty := []byte{}
-	copiedEmpty := copyBytes(empty)
-	require.NotNil(copiedEmpty)
-	require.Len(copiedEmpty, 0)
-
-	// Test normal slice
-	original := []byte{1, 2, 3, 4, 5}
-	copied := copyBytes(original)
-	require.Equal(original, copied)
-
-	// Verify they're different backing arrays
-	copied[0] = 99
-	require.NotEqual(original[0], copied[0])
-	require.Equal(byte(1), original[0])
-	require.Equal(byte(99), copied[0])
-}
-
-func TestBytesEqual(t *testing.T) {
-	require := require.New(t)
-
-	// Equal slices
-	require.True(bytesEqual([]byte{1, 2, 3}, []byte{1, 2, 3}))
-
-	// Different lengths
-	require.False(bytesEqual([]byte{1, 2, 3}, []byte{1, 2}))
-
-	// Different values
-	require.False(bytesEqual([]byte{1, 2, 3}, []byte{1, 2, 4}))
-
-	// Empty slices
-	require.True(bytesEqual([]byte{}, []byte{}))
-}
-
-func TestMin(t *testing.T) {
-	require := require.New(t)
-
-	require.Equal(1, min(1, 2))
-	require.Equal(1, min(2, 1))
-	require.Equal(5, min(5, 5))
-	require.Equal(-1, min(-1, 0))
-}

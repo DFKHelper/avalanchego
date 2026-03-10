@@ -5,12 +5,13 @@ package server
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 
 	"github.com/ava-labs/avalanchego/cache/lru"
 	"github.com/ava-labs/avalanchego/utils/logging"
+	"github.com/ava-labs/avalanchego/utils/set"
 )
 
 const (
@@ -77,7 +79,7 @@ type rpcCache struct {
 	mu      sync.RWMutex
 
 	// Read-only methods that are safe to cache
-	cacheableMethods map[string]bool
+	cacheableMethods set.Set[string]
 }
 
 // newRPCCache creates a new RPC cache instance
@@ -86,7 +88,7 @@ func newRPCCache(log logging.Logger, config RPCCacheConfig, registerer prometheu
 		return nil, nil
 	}
 
-	// Validate config (BUG #10 fix)
+	// Validate config
 	if config.Size <= 0 {
 		return nil, fmt.Errorf("cache size must be positive, got %d", config.Size)
 	}
@@ -113,29 +115,18 @@ func newRPCCache(log logging.Logger, config RPCCacheConfig, registerer prometheu
 		}),
 	}
 
-	// Register metrics with cleanup on failure (BUG #12 fix)
-	if err := registerer.Register(metrics.hits); err != nil {
-		return nil, err
-	}
-	if err := registerer.Register(metrics.misses); err != nil {
-		registerer.Unregister(metrics.hits)
-		return nil, err
-	}
-	if err := registerer.Register(metrics.evictions); err != nil {
-		registerer.Unregister(metrics.hits)
-		registerer.Unregister(metrics.misses)
-		return nil, err
-	}
-	if err := registerer.Register(metrics.size); err != nil {
-		registerer.Unregister(metrics.hits)
-		registerer.Unregister(metrics.misses)
-		registerer.Unregister(metrics.evictions)
+	if err := errors.Join(
+		registerer.Register(metrics.hits),
+		registerer.Register(metrics.misses),
+		registerer.Register(metrics.evictions),
+		registerer.Register(metrics.size),
+	); err != nil {
 		return nil, err
 	}
 
 	cache := lru.NewCacheWithOnEvict(config.Size, func(key string, value *cacheEntry) {
 		metrics.evictions.Inc()
-		metrics.size.Dec()
+		// size is managed by Set() after each mutation; no Dec() needed here
 	})
 
 	rc := &rpcCache{
@@ -143,28 +134,27 @@ func newRPCCache(log logging.Logger, config RPCCacheConfig, registerer prometheu
 		config:  config,
 		cache:   cache,
 		metrics: metrics,
-		cacheableMethods: map[string]bool{
-			"eth_call":                   true,
-			"eth_getBalance":             true,
-			"eth_getCode":                true,
-			"eth_getStorageAt":           true,
-			"eth_getBlockByNumber":       true,
-			"eth_getBlockByHash":         true,
-			"eth_getTransactionByHash":   true,
-			"eth_getTransactionReceipt":  true,
-			"eth_getBlockTransactionCountByNumber": true,
-			"eth_getBlockTransactionCountByHash":   true,
-			"eth_getUncleCountByBlockNumber":       true,
-			"eth_getUncleCountByBlockHash":         true,
-			"eth_getTransactionCount":              true,
-			"eth_getLogs":                          true,
-			"net_version":                          true,
-			"web3_clientVersion":                   true,
-			"web3_sha3":                            true,
-		},
+		cacheableMethods: set.Of(
+			"eth_call",
+			"eth_getBalance",
+			"eth_getCode",
+			"eth_getStorageAt",
+			"eth_getBlockByNumber",
+			"eth_getBlockByHash",
+			"eth_getTransactionByHash",
+			"eth_getTransactionReceipt",
+			"eth_getBlockTransactionCountByNumber",
+			"eth_getBlockTransactionCountByHash",
+			"eth_getUncleCountByBlockNumber",
+			"eth_getUncleCountByBlockHash",
+			"eth_getTransactionCount",
+			"eth_getLogs",
+			"net_version",
+			"web3_clientVersion",
+			"web3_sha3",
+		),
 	}
 
-	// Set initial size metric (BUG #7 fix)
 	rc.metrics.size.Set(float64(rc.cache.Len()))
 
 	return rc, nil
@@ -183,24 +173,20 @@ func (rc *rpcCache) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Read request body with size limit (BUG #26 fix)
-		// Limit to MaxResponseSize to prevent DoS via large request bodies
+		// Limit request body size to prevent DoS via large request bodies
 		limitedReader := io.LimitReader(r.Body, MaxResponseSize+1)
 		body, err := io.ReadAll(limitedReader)
-		// Always restore body (BUG #5 fix)
 		r.Body = io.NopCloser(bytes.NewBuffer(body))
 		if err != nil {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// Reject oversized requests (BUG #26 fix)
 		if len(body) > MaxResponseSize {
 			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 
-		// Detect batch requests with whitespace handling (BUG #9 and #27 fix)
-		// JSON allows leading whitespace, so trim before checking
+		// JSON allows leading whitespace; trim before checking for batch requests
 		trimmed := bytes.TrimLeft(body, " \t\n\r")
 		if len(trimmed) > 0 && trimmed[0] == '[' {
 			next.ServeHTTP(w, r)
@@ -223,7 +209,7 @@ func (rc *rpcCache) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Normalize nil/empty params (BUG #13 and #19 fix)
+		// Normalize nil/empty params for consistent cache keys
 		if len(rpcReq.Params) == 0 {
 			rpcReq.Params = json.RawMessage("[]")
 		} else {
@@ -231,8 +217,8 @@ func (rc *rpcCache) Middleware(next http.Handler) http.Handler {
 			if paramStr == "null" || paramStr == "{}" {
 				rpcReq.Params = json.RawMessage("[]")
 			} else if len(rpcReq.Params) <= MaxParamSizeForCanonicalization {
-				// Canonicalize JSON to handle whitespace variations (BUG #18 and #29 fix)
-				// Only for reasonably-sized params to avoid excessive allocations
+				// Canonicalize JSON for consistent cache keys regardless of whitespace;
+				// skip large params to avoid excessive allocations
 				var params interface{}
 				if err := json.Unmarshal(rpcReq.Params, &params); err == nil {
 					if canonical, err := json.Marshal(params); err == nil {
@@ -243,9 +229,7 @@ func (rc *rpcCache) Middleware(next http.Handler) http.Handler {
 							zap.Error(err))
 					}
 				}
-				// If unmarshal fails, use original params (likely not valid JSON)
 			}
-			// Params > 100KB skip canonicalization (use original, BUG #29 fix)
 		}
 
 		// Generate cache key
@@ -254,19 +238,17 @@ func (rc *rpcCache) Middleware(next http.Handler) http.Handler {
 		// Try to get from cache
 		if entry, found := rc.get(cacheKey); found {
 			rc.metrics.hits.Inc()
-			// Copy response bytes to prevent data races (BUG #15 fix)
+			// Copy response bytes — entry may be evicted and GC'd after lock release
 			responseCopy := make([]byte, len(entry.response))
 			copy(responseCopy, entry.response)
 
-			// Restore cached headers (BUG #16, #21, #28 fix)
-			// Use Clone() for efficient deep copy
+			// Deep copy headers to avoid sharing the cached map
 			restoredHeaders := entry.headers.Clone()
 			for k, v := range restoredHeaders {
 				w.Header()[k] = v
 			}
 			w.Header().Set("X-Cache", "HIT")
 			w.WriteHeader(entry.status)
-			// Log write errors (BUG #6 fix)
 			if _, err := w.Write(responseCopy); err != nil {
 				rc.log.Error("failed to write cached response", zap.Error(err))
 			}
@@ -274,8 +256,6 @@ func (rc *rpcCache) Middleware(next http.Handler) http.Handler {
 		}
 
 		rc.metrics.misses.Inc()
-
-		// Set X-Cache header before serving (BUG #3 fix)
 		w.Header().Set("X-Cache", "MISS")
 
 		// Capture response
@@ -290,12 +270,9 @@ func (rc *rpcCache) Middleware(next http.Handler) http.Handler {
 		// Cache successful responses within size limit
 		responseBytes := recorder.body.Bytes()
 		if recorder.statusCode == http.StatusOK {
-			// Check max response size (BUG #8 fix)
 			if len(responseBytes) <= MaxResponseSize {
-				// Capture headers with deep copy (BUG #16 and #20 fix)
 				headers := recorder.Header().Clone()
 
-				// Copy response bytes to prevent modifications (BUG #25 fix)
 				responseCopy := make([]byte, len(responseBytes))
 				copy(responseCopy, responseBytes)
 
@@ -316,23 +293,23 @@ func (rc *rpcCache) Middleware(next http.Handler) http.Handler {
 }
 
 func (rc *rpcCache) isCacheable(method string) bool {
-	// Always check whitelist to prevent caching state-changing methods (BUG #11 fix)
-	// Readonly flag just enables/disables caching entirely
+	// Readonly flag enables caching of whitelisted read-only methods
 	if !rc.config.Readonly {
 		return false
 	}
-	return rc.cacheableMethods[method]
+	return rc.cacheableMethods.Contains(method)
 }
 
 func (rc *rpcCache) generateKey(method string, params json.RawMessage) string {
-	hash := sha256.New()
-	hash.Write([]byte(method))
-	hash.Write(params)
-	return hex.EncodeToString(hash.Sum(nil))
+	h := fnv.New64a()
+	h.Write([]byte(method))
+	h.Write([]byte{0}) // null separator prevents collisions from adjacent method/params bytes
+	h.Write(params)
+	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 func (rc *rpcCache) get(key string) (*cacheEntry, bool) {
-	// BUG #1 fix: Remove defer to avoid deadlock with manual lock management
+	// No defer — lock is manually managed to allow lock upgrade for TTL eviction
 	rc.mu.RLock()
 
 	entry, found := rc.cache.Get(key)
@@ -347,10 +324,11 @@ func (rc *rpcCache) get(key string) (*cacheEntry, bool) {
 
 		// Upgrade to write lock for eviction
 		rc.mu.Lock()
-		// BUG #2 fix: Re-check after acquiring write lock
+		// Re-check after acquiring write lock to handle concurrent TTL expiry
 		entry, found = rc.cache.Get(key)
 		if found && time.Since(entry.timestamp) > rc.config.TTL {
 			rc.cache.Evict(key)
+			rc.metrics.size.Set(float64(rc.cache.Len()))
 		}
 		rc.mu.Unlock()
 		return nil, false
@@ -368,8 +346,8 @@ func (rc *rpcCache) put(key string, entry *cacheEntry) {
 	rc.metrics.size.Set(float64(rc.cache.Len()))
 }
 
-// Invalidate removes entries from the cache
-func (rc *rpcCache) Invalidate(prefix string) {
+// Flush removes all entries from the cache
+func (rc *rpcCache) Flush() {
 	if rc == nil {
 		return
 	}
@@ -377,8 +355,6 @@ func (rc *rpcCache) Invalidate(prefix string) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 
-	// For now, flush entire cache on invalidation
-	// TODO: Implement prefix-based invalidation
 	rc.cache.Flush()
 	rc.metrics.size.Set(0)
 }
@@ -388,7 +364,7 @@ type responseRecorder struct {
 	http.ResponseWriter
 	body          *bytes.Buffer
 	statusCode    int
-	headerWritten bool // BUG #4 fix: Track if WriteHeader was called
+	headerWritten bool
 }
 
 func (rec *responseRecorder) Write(buf []byte) (int, error) {
@@ -401,7 +377,7 @@ func (rec *responseRecorder) Write(buf []byte) (int, error) {
 }
 
 func (rec *responseRecorder) WriteHeader(statusCode int) {
-	// BUG #4 fix: Only set status on first call
+	// Only record the first WriteHeader call
 	if rec.headerWritten {
 		return
 	}

@@ -187,7 +187,7 @@ func TestRPCCache_DifferentParams(t *testing.T) {
 	require.Equal(2, callCount, "Different params should result in different cache entries")
 }
 
-func TestRPCCache_Invalidate(t *testing.T) {
+func TestRPCCache_Flush(t *testing.T) {
 	require := require.New(t)
 
 	cache, err := newRPCCache(
@@ -217,8 +217,8 @@ func TestRPCCache_Invalidate(t *testing.T) {
 	cachedHandler.ServeHTTP(rec1, req1)
 	require.Equal(1, callCount)
 
-	// Invalidate cache
-	cache.Invalidate("")
+	// Flush cache
+	cache.Flush()
 
 	// Second request after invalidation (cache MISS again)
 	req2 := httptest.NewRequest(http.MethodPost, "/ext/bc/C/rpc", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"eth_call","params":[],"id":1}`))
@@ -346,7 +346,6 @@ func BenchmarkRPCCache_Miss(b *testing.B) {
 	}
 }
 
-// Test for BUG #9 fix: JSON-RPC batch requests not handled
 func TestRPCCache_BatchRequestNotCached(t *testing.T) {
 	require := require.New(t)
 
@@ -384,7 +383,6 @@ func TestRPCCache_BatchRequestNotCached(t *testing.T) {
 	require.Equal(2, callCount, "Batch requests should not be cached")
 }
 
-// Test for BUG #13 fix: Missing nil params handling
 func TestRPCCache_NilParamsNormalization(t *testing.T) {
 	require := require.New(t)
 
@@ -424,7 +422,6 @@ func TestRPCCache_NilParamsNormalization(t *testing.T) {
 	require.Equal("HIT", rec2.Header().Get("X-Cache"))
 }
 
-// Test for BUG #10 fix: Config validation
 func TestRPCCache_ConfigValidation(t *testing.T) {
 	require := require.New(t)
 
@@ -457,7 +454,6 @@ func TestRPCCache_ConfigValidation(t *testing.T) {
 	require.Contains(err.Error(), "cache TTL must be positive")
 }
 
-// Test for BUG #11 fix: Readonly=false should disable caching
 func TestRPCCache_ReadonlyFalseDisablesCaching(t *testing.T) {
 	require := require.New(t)
 
@@ -495,7 +491,6 @@ func TestRPCCache_ReadonlyFalseDisablesCaching(t *testing.T) {
 	require.Equal(2, callCount, "Readonly=false should disable all caching")
 }
 
-// Test for BUG #8 fix: Max response size limit
 func TestRPCCache_MaxResponseSize(t *testing.T) {
 	require := require.New(t)
 
@@ -539,7 +534,6 @@ func TestRPCCache_MaxResponseSize(t *testing.T) {
 	require.Equal(2, callCount, "Large responses should not be cached")
 }
 
-// Test for BUG #4 fix: WriteHeader called multiple times
 func TestRPCCache_ResponseRecorderMultipleWriteHeader(t *testing.T) {
 	require := require.New(t)
 
@@ -560,7 +554,6 @@ func TestRPCCache_ResponseRecorderMultipleWriteHeader(t *testing.T) {
 	require.Equal(http.StatusOK, recorder.statusCode, "Second WriteHeader should be ignored")
 }
 
-// Test for BUG #16 fix: Response headers cached
 func TestRPCCache_HeadersCached(t *testing.T) {
 	require := require.New(t)
 
@@ -607,7 +600,6 @@ func TestRPCCache_HeadersCached(t *testing.T) {
 	require.Equal("application/json", rec2.Header().Get("Content-Type"), "Content-Type should be cached")
 }
 
-// Test for BUG #18 fix: JSON whitespace normalization
 func TestRPCCache_JSONWhitespaceNormalization(t *testing.T) {
 	require := require.New(t)
 
@@ -647,7 +639,6 @@ func TestRPCCache_JSONWhitespaceNormalization(t *testing.T) {
 	require.Equal("HIT", rec2.Header().Get("X-Cache"))
 }
 
-// Test for BUG #19 fix: Empty object normalization
 func TestRPCCache_EmptyObjectNormalization(t *testing.T) {
 	require := require.New(t)
 
@@ -695,7 +686,6 @@ func TestRPCCache_EmptyObjectNormalization(t *testing.T) {
 	require.Equal("HIT", rec3.Header().Get("X-Cache"))
 }
 
-// Test for BUG #20 and #21 fix: Headers deep-copied (no shared slices)
 func TestRPCCache_HeadersIndependent(t *testing.T) {
 	require := require.New(t)
 
@@ -753,7 +743,6 @@ func TestRPCCache_HeadersIndependent(t *testing.T) {
 	require.Equal([]string{"value1", "value2"}, thirdHeaders, "Headers should be independent, not sharing slices")
 }
 
-// Test for BUG #26 fix: Request body size limit (DoS protection)
 func TestRPCCache_RequestSizeLimit(t *testing.T) {
 	require := require.New(t)
 
@@ -791,7 +780,6 @@ func TestRPCCache_RequestSizeLimit(t *testing.T) {
 	require.Equal(http.StatusRequestEntityTooLarge, rec.Code, "Oversized requests should be rejected")
 }
 
-// Test for BUG #27 fix: Batch requests with leading whitespace
 func TestRPCCache_BatchRequestWithWhitespace(t *testing.T) {
 	require := require.New(t)
 
@@ -832,7 +820,6 @@ func TestRPCCache_BatchRequestWithWhitespace(t *testing.T) {
 	}
 }
 
-// Test for BUG #29 fix: Large params skip canonicalization
 func TestRPCCache_LargeParamsSkipCanonicalization(t *testing.T) {
 	require := require.New(t)
 

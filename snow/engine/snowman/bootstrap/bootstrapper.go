@@ -186,7 +186,7 @@ func New(config Config, onFinished func(ctx context.Context, lastReqID uint32) e
 		defer config.Ctx.Lock.Unlock()
 
 		if err := bs.Timeout(); err != nil {
-			bs.Config.Ctx.Log.Warn("Encountered error during bootstrapping: %w", zap.Error(err))
+			bs.Config.Ctx.Log.Warn("Encountered error during bootstrapping", zap.Error(err))
 		}
 	}
 	bs.TimeoutRegistrar = common.NewTimeoutScheduler(timeout, config.BootstrapTracker.AllBootstrapped())
@@ -248,10 +248,11 @@ func (b *Bootstrapper) HasProgress(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
-	// Reject only truly stale checkpoints (>7 days old)
+	// Preserve even "stale" checkpoints (>7 days old) as long as blocks exist —
+	// blocks in the tree are valuable and shouldn't be discarded based on age alone.
 	age := time.Since(checkpoint.Timestamp)
 	if age < 0 || age > 7*24*time.Hour {
-		b.Ctx.Log.Warn("checkpoint has invalid timestamp but blocks exist, preserving progress",
+		b.Ctx.Log.Warn("checkpoint has unusual timestamp but blocks exist, preserving progress",
 			zap.Duration("age", age),
 			zap.Int("numBlocks", int(tree.Len())))
 		return true, nil
@@ -911,10 +912,14 @@ func (b *Bootstrapper) tryStartExecuting(ctx context.Context) error {
 				)
 			}
 
+			var pctComplete float64
+			if numToExecute > 0 {
+				pctComplete = float64(executeCheckpoint.NumExecuted) / float64(numToExecute) * 100
+			}
 			b.Ctx.Log.Info("found execute checkpoint from previous run",
 				zap.Uint64("numExecuted", executeCheckpoint.NumExecuted),
 				zap.Uint64("totalToExecute", numToExecute),
-				zap.Float64("pctComplete", float64(executeCheckpoint.NumExecuted)/float64(numToExecute)*100),
+				zap.Float64("pctComplete", pctComplete),
 				zap.Duration("age", time.Since(executeCheckpoint.Timestamp)),
 			)
 
@@ -973,7 +978,10 @@ func (b *Bootstrapper) tryStartExecuting(ctx context.Context) error {
 
 		// Save external checkpoint file (survives database crashes)
 		// This ensures we always know the last progress even if the database resets
-		pctComplete := float64(numExecuted) / float64(totalToExecute) * 100
+		var pctComplete float64
+		if totalToExecute > 0 {
+			pctComplete = float64(numExecuted) / float64(totalToExecute) * 100
+		}
 		externalCheckpoint := fmt.Sprintf(
 			`{"chain":"%s","numExecuted":%d,"totalToExecute":%d,"pctComplete":%.2f,"timestamp":"%s"}`,
 			b.Ctx.ChainID,
@@ -1084,11 +1092,22 @@ func (b *Bootstrapper) tryStartExecuting(ctx context.Context) error {
 	// syncing.
 	if !b.Config.BootstrapTracker.IsBootstrapped() {
 		log("waiting for the remaining chains in this subnet to finish syncing")
+		// Stop the periodic retry timer now — a state sync retry fired during
+		// the awaitingTimeout window would wrongly restart bootstrapping.
+		if b.periodicRetryTimer != nil {
+			b.periodicRetryTimer.Stop()
+			b.periodicRetryTimer = nil
+		}
 		// Restart bootstrapping after [bootstrappingDelay] to keep up to date
 		// on the latest tip.
 		b.awaitingTimeout = true
 		b.TimeoutRegistrar.RegisterTimeout(bootstrappingDelay)
 		return nil
+	}
+	// Stop the periodic retry timer before transitioning to consensus.
+	if b.periodicRetryTimer != nil {
+		b.periodicRetryTimer.Stop()
+		b.periodicRetryTimer = nil
 	}
 	return b.onFinished(ctx, b.requestID)
 }
@@ -1144,6 +1163,14 @@ func (b *Bootstrapper) Timeout() error {
 		return errUnexpectedTimeout
 	}
 	b.awaitingTimeout = false
+
+	// Stop the periodic retry timer regardless of which path we take — if
+	// restarting bootstrapping, the old timer must not fire against the new
+	// round's state; if transitioning to consensus, it must not fire at all.
+	if b.periodicRetryTimer != nil {
+		b.periodicRetryTimer.Stop()
+		b.periodicRetryTimer = nil
+	}
 
 	if !b.Config.BootstrapTracker.IsBootstrapped() {
 		return b.restartBootstrapping(context.TODO())
@@ -1574,6 +1601,7 @@ func (b *Bootstrapper) Shutdown(ctx context.Context) error {
 
 	if b.periodicRetryTimer != nil {
 		b.periodicRetryTimer.Stop()
+		b.periodicRetryTimer = nil
 	}
 
 	return b.VM.Shutdown(ctx)

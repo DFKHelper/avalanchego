@@ -1,0 +1,45 @@
+#!/bin/bash
+DFK_ID="q2aTwKuyzgs8pynF7UXBZCU7DejbZbZ6EUyHr3JQzYgwNPUPi"
+RPC="http://localhost:9650/ext/bc/${DFK_ID}/rpc"
+echo "🔗 DFK CURRENT BLOCK"
+echo "═══════════════════════════════════════════════════════════"
+echo ""
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+
+curl -sf --max-time 5 -X POST "$RPC" \
+    -H "Content-Type: application/json" \
+    -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+    2>/dev/null > "$TMP"
+
+BLOCK_HEX=$(python3 -c "import json,sys; d=json.load(open('$TMP')); print(d['result'])" 2>/dev/null)
+if [ -z "$BLOCK_HEX" ]; then echo "   ⚠️  Could not reach RPC"; exit 1; fi
+BLOCK_NUM=$(( $BLOCK_HEX ))
+
+curl -sf --max-time 5 -X POST "$RPC" \
+    -H "Content-Type: application/json" \
+    --data-raw '{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["'"$BLOCK_HEX"'",false],"id":1}' \
+    2>/dev/null > "$TMP"
+
+python3 - "$BLOCK_NUM" "$TMP" << 'PY'
+import json, sys
+from datetime import datetime, timezone
+block_num = sys.argv[1]
+with open(sys.argv[2]) as f: data = json.load(f)
+b = data.get("result") or {}
+ts = int(b.get("timestamp", "0x0"), 16)
+dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if ts else "?"
+txcount = len(b.get("transactions", []))
+gu = int(b.get("gasUsed", "0x0"), 16)
+gl = int(b.get("gasLimit", "0x1"), 16)
+pct = gu / gl * 100
+h = b.get("hash", "?")
+print(f"   Height:     {block_num}")
+print(f"   Timestamp:  {dt}")
+print(f"   Tx count:   {txcount}")
+print(f"   Gas used:   {gu:,} / {gl:,} ({pct:.1f}%)")
+print(f"   Hash:       {h[:20]}...")
+PY
+echo ""
+echo "═══════════════════════════════════════════════════════════"
+echo "Updated: $(date '+%Y-%m-%d %H:%M:%S')"

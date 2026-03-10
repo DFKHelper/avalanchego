@@ -1,0 +1,83 @@
+#!/bin/bash
+DFK_ID="q2aTwKuyzgs8pynF7UXBZCU7DejbZbZ6EUyHr3JQzYgwNPUPi"
+DFK_SUBNET="Vn3aX6hNRstj5VHHm63TCgPNaeGnRSqCYXQqemSqDd2TQH4qJ"
+VM_PREFIX="mDV3QWRXfwgKUWb9sggkv4vQxAQR4y2CyKrt5pLZ5SzQ7EHBv"
+echo "📊 DFK NODE METRICS"
+echo "═══════════════════════════════════════════════════════════"
+echo ""
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+curl -sf --max-time 10 http://localhost:9650/ext/metrics 2>/dev/null > "$TMP"
+if [ ! -s "$TMP" ]; then echo "   ⚠️  Metrics endpoint unreachable"; exit 1; fi
+
+python3 - "$TMP" "$DFK_ID" "$DFK_SUBNET" "$VM_PREFIX" << 'PY'
+import sys, re
+
+with open(sys.argv[1]) as f:
+    lines = f.read().splitlines()
+dfk_id = sys.argv[2]
+dfk_subnet = sys.argv[3]
+vm_pfx = sys.argv[4]
+
+def get(name):
+    for l in lines:
+        if l.startswith(name + " ") and not l.startswith("#"):
+            return l.split()[-1]
+    return None
+
+def getl(name, label):
+    for l in lines:
+        if l.startswith(name + "{") and label in l:
+            return l.split()[-1]
+    return None
+
+def getl_vm(suffix, label):
+    name = f"avalanche_{vm_pfx}_process_{suffix}"
+    return getl(name, label)
+
+def sum_msgs(io_val):
+    total = 0
+    for l in lines:
+        if l.startswith("avalanche_network_msgs{") and f'io="{io_val}"' in l:
+            try: total += float(l.split()[-1])
+            except: pass
+    return total
+
+def fmt_num(v):
+    try: return f"{float(v):,.0f}"
+    except: return str(v) if v else "?"
+
+def fmt_mb(v):
+    try: return f"{float(v)/1024/1024:.1f} MB"
+    except: return "?"
+
+print("📦 CHAIN STATUS")
+bs = getl("avalanche_snowman_bootstrap_finished", dfk_id)
+print(f"   Bootstrap:       {'✅ complete' if bs == '1' else '⏳ in progress'}")
+print()
+
+print("🌐 NETWORK")
+print(f"   Total peers:     {get('avalanche_network_peers') or '?'}")
+print(f"   DFK subnet:      {getl('avalanche_network_peers_subnet', dfk_subnet) or '?'}/6")
+print(f"   Tracked peers:   {get('avalanche_network_tracked_peers') or '?'}")
+print()
+
+print("📨 MESSAGES (since start)")
+sent = sum_msgs("sent")
+recv = sum_msgs("received")
+print(f"   Sent:            {sent:,.0f}")
+print(f"   Received:        {recv:,.0f}")
+print()
+
+print("💾 MEMORY  (DFK VM process)")
+print(f"   Heap alloc:      {fmt_mb(getl_vm('go_memstats_alloc_bytes', dfk_id))}")
+sys_bytes = getl_vm('go_memstats_sys_bytes', dfk_id) or getl_vm('go_memstats_heap_sys_bytes', dfk_id)
+print(f"   System total:    {fmt_mb(sys_bytes)}")
+print()
+
+print("⚙️  GOROUTINES  (DFK VM process)")
+print(f"   Active:          {getl_vm('go_goroutines', dfk_id) or '?'}")
+PY
+echo ""
+echo "═══════════════════════════════════════════════════════════"
+echo "Updated: $(date '+%Y-%m-%d %H:%M:%S')"

@@ -1,0 +1,21 @@
+#!/bin/bash
+DFK_LOG="/root/.avalanchego/logs/q2aTwKuyzgs8pynF7UXBZCU7DejbZbZ6EUyHr3JQzYgwNPUPi.log"
+MAIN_LOG="/root/.avalanchego/logs/main.log"
+LINES="${1:-200}"
+echo "⚠️  RECENT ERRORS & WARNINGS (last ${LINES} lines per log)"
+echo "═══════════════════════════════════════════════════════════"
+echo ""
+echo "--- DFK chain log ---"
+tail -"${LINES}" "$DFK_LOG" 2>/dev/null \
+    | grep -E '\b(ERROR|WARN)\b' \
+    | grep -v "execution reverted\|ERC20\|insufficient funds" \
+    | tail -30 || echo "   (none)"
+echo ""
+echo "--- Main node log ---"
+tail -"${LINES}" "$MAIN_LOG" 2>/dev/null \
+    | grep -E '\b(ERROR|WARN)\b' \
+    | tail -20 || echo "   (none)"
+echo ""
+echo "═══════════════════════════════════════════════════════════"
+echo "Updated: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Tip: dfk-errors 500  — scan last 500 lines"
